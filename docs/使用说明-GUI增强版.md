@@ -21,7 +21,7 @@
 ## 支持网站信息
 - 顶部按钮：`支持网站信息`。
 - 点击后打开可搜索弹窗，显示可点击链接的网站清单。
-- 清单来源：`/Users/liuze/Downloads/bookget-main/router/interface.go`。
+- 清单来源：[bookget 倉庫 `router/interface.go`](https://github.com/deweizhu/bookget/blob/main/router/interface.go)。
 - 另有通用模式：`bookget`、`iiif.io`、`dzicnlib`。
 
 ## 历史记录

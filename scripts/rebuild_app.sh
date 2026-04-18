@@ -28,9 +28,9 @@ if [[ ! -f "$HELPER_SRC" ]]; then
   exit 1
 fi
 
-mkdir -p /tmp/clang-module-cache-codex /tmp/swift-module-cache-codex
-export CLANG_MODULE_CACHE_PATH=/tmp/clang-module-cache-codex
-export SWIFT_MODULECACHE_PATH=/tmp/swift-module-cache-codex
+mkdir -p /tmp/clang-module-cache-bookget-gui /tmp/swift-module-cache-bookget-gui
+export CLANG_MODULE_CACHE_PATH=/tmp/clang-module-cache-bookget-gui
+export SWIFT_MODULECACHE_PATH=/tmp/swift-module-cache-bookget-gui
 
 ts="$(date +%Y%m%d_%H%M%S)"
 if [[ -f "$APP_BIN" ]]; then
@@ -42,7 +42,7 @@ fi
 
 echo "[build] compile launcher..."
 swiftc -parse-as-library \
-  -module-cache-path /tmp/clang-module-cache-codex \
+  -module-cache-path /tmp/clang-module-cache-bookget-gui \
   -target "$TARGET" \
   -o "$APP_BIN" \
   "$GUI_SRC"
@@ -50,7 +50,7 @@ chmod +x "$APP_BIN"
 
 echo "[build] compile web-login helper..."
 swiftc \
-  -module-cache-path /tmp/clang-module-cache-codex \
+  -module-cache-path /tmp/clang-module-cache-bookget-gui \
   -target "$TARGET" \
   -o "$HELPER_BIN" \
   "$HELPER_SRC"
