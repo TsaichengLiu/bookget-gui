@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# 構建產物 / 二進制（由 scripts/rebuild_app.sh 生成）
+*.bak
+*.bak.*
+app-template/Contents/_CodeSignature/
+app-template/Contents/MacOS/
+app-template/Contents/Resources/bin/bookget-core
+app-template/Contents/Resources/bin/bookget-web-login
+app-template/Contents/Resources/bin/dezoomify-rs
+
+# 如果本地試裝過 .app，忽略整個 .app
+*.app/
+
+# 用戶數據與登錄態（絕對不能提交）
+cookie.txt
+**/cookie.txt
+localStorage.txt
+**/localStorage.txt
+urls.txt
+**/urls.txt
+
+# Swift / Xcode
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# 編輯器
+.idea/
+.vscode/
+*.swp
+*~

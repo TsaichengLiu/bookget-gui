@@ -1,0 +1,2183 @@
+#!/bin/zsh
+set -u
+
+SCRIPT_DIR="${0:A:h}"
+CORE_BIN="$SCRIPT_DIR/bookget-core"
+
+if [[ ! -x "$CORE_BIN" ]]; then
+  echo "bookget wrapper error: missing core binary at $CORE_BIN" >&2
+  exit 127
+fi
+
+# Parse args while preserving original order for single URL mode.
+orig_args=("$@")
+input_file=""
+max_threads=""
+auto_mode_explicit=0
+login_required_explicit=0
+login_required=0
+output_dir=""
+output_dir_explicit=0
+dzi_explicit=0
+dzi_choice=""
+capture_interval_seconds=""
+default_urls_file="$SCRIPT_DIR/urls.txt"
+default_cwd_urls_file="$PWD/urls.txt"
+
+idx=1
+while (( idx <= $# )); do
+  arg="${@[idx]}"
+  case "$arg" in
+    -i)
+      (( idx++ ))
+      if (( idx <= $# )); then
+        input_file="${@[idx]}"
+      fi
+      ;;
+    -i=*)
+      input_file="${arg#-i=}"
+      ;;
+    -n)
+      (( idx++ ))
+      if (( idx <= $# )); then
+        max_threads="${@[idx]}"
+      fi
+      ;;
+    -n=*)
+      max_threads="${arg#-n=}"
+      ;;
+    -a)
+      (( idx++ ))
+      if (( idx <= $# )); then
+        auto_mode_explicit=1
+      fi
+      ;;
+    -a=*)
+      auto_mode_explicit=1
+      ;;
+    -dzi)
+      dzi_explicit=1
+      dzi_choice="true"
+      ;;
+    -dzi=*)
+      dzi_explicit=1
+      dzi_val="${arg#-dzi=}"
+      case "${dzi_val:l}" in
+        0|false|no|off) dzi_choice="false" ;;
+        1|true|yes|on)  dzi_choice="true" ;;
+        *)              dzi_choice="true" ;;
+      esac
+      ;;
+    -o)
+      (( idx++ ))
+      if (( idx <= $# )); then
+        output_dir="${@[idx]}"
+        output_dir_explicit=1
+      fi
+      ;;
+    -o=*)
+      output_dir="${arg#-o=}"
+      output_dir_explicit=1
+      ;;
+    -speed)
+      (( idx++ ))
+      if (( idx <= $# )); then
+        capture_interval_seconds="${@[idx]}"
+      fi
+      ;;
+    -speed=*)
+      capture_interval_seconds="${arg#-speed=}"
+      ;;
+    -interval)
+      (( idx++ ))
+      if (( idx <= $# )); then
+        capture_interval_seconds="${@[idx]}"
+      fi
+      ;;
+    -interval=*)
+      capture_interval_seconds="${arg#-interval=}"
+      ;;
+    -login)
+      login_required_explicit=1
+      login_required=1
+      ;;
+    -login=*)
+      login_required_explicit=1
+      login_val="${arg#-login=}"
+      case "${login_val:l}" in
+        0|false|no|off) login_required=0 ;;
+        1|true|yes|on)  login_required=1 ;;
+        *)              login_required=1 ;;
+      esac
+      ;;
+  esac
+  (( idx++ ))
+done
+
+# For safety, clamp concurrency to avoid freezes on low-memory machines.
+if [[ -n "$max_threads" && "$max_threads" == <-> ]] && (( max_threads > 8 )); then
+  max_threads="8"
+fi
+
+typeset -a cli_urls
+typeset -a filtered_args
+typeset -A seen_urls
+
+# Auto login/captcha flow (no GUI source needed):
+# When downloads produce HTML error pages (exit=95), open a temporary WKWebView
+# window for the user to login/verify, then retry automatically.
+typeset -A AUTO_COOKIE_BY_HOST
+typeset -A AUTO_FINAL_URL_BY_HOST
+typeset -A AUTO_LOGIN_TRIED_BY_HOST
+typeset -a AUTO_COOKIE_TEMP_FILES
+DEFAULTS_DOMAIN="com.bookget.gui.launcher.autologin"
+DEFAULTS_KEY_NEED_LOGIN="bookget.last.needLogin"
+
+cleanup_auto_cookie_files() {
+  local f
+  for f in "${AUTO_COOKIE_TEMP_FILES[@]}"; do
+    [[ -n "$f" ]] || continue
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+trap cleanup_auto_cookie_files EXIT
+
+parent_domain_key() {
+  local host="$1"
+  local parent=""
+
+  # Only widen scope when host has at least 3 labels (two dots). This avoids
+  # accidental matches like "example.com" -> "com".
+  if [[ "$host" == *.*.* ]]; then
+    parent="${host#*.}"
+  fi
+  print -r -- "$parent"
+}
+
+defaults_login_required() {
+  local raw=""
+
+  command -v defaults >/dev/null 2>&1 || return 1
+  raw="$(defaults read "$DEFAULTS_DOMAIN" "$DEFAULTS_KEY_NEED_LOGIN" 2>/dev/null || true)"
+  raw="${raw//$'\r'/}"
+  raw="${raw//$'\n'/}"
+  raw="${raw:l}"
+
+  case "$raw" in
+    1|true|yes) return 0 ;;
+    0|false|no) return 1 ;;
+  esac
+  return 1
+}
+
+should_prelogin() {
+  if (( login_required_explicit == 1 )); then
+    (( login_required == 1 ))
+    return $?
+  fi
+  defaults_login_required
+  return $?
+}
+
+is_shanghai_library_detail_url() {
+  local url="$1"
+  local lc="${url:l}"
+  [[ "$lc" == *"gj.library.sh.cn/org/info/shl"* ]]
+}
+
+is_shanghai_library_pdfview_url() {
+  local url="$1"
+  local lc="${url:l}"
+  [[ "$lc" == *"dhapi.library.sh.cn/pdfview/"* && "$url" == *\?* ]]
+}
+
+should_force_prelogin_for_url() {
+  local url="$1"
+
+  if is_shanghai_library_detail_url "$url"; then
+    return 0
+  fi
+  return 1
+}
+
+run_shanghai_library_pdf_download() {
+  local url="$1"
+  local helper="$SCRIPT_DIR/bookget-web-login"
+  local target_output_dir="$output_dir"
+
+  if [[ -z "$target_output_dir" ]]; then
+    target_output_dir="$PWD"
+  fi
+  mkdir -p "$target_output_dir" 2>/dev/null || true
+
+  if [[ ! -x "$helper" ]]; then
+    echo "[bookget wrapper] missing Shanghai Library helper: $helper" >&2
+    return 1
+  fi
+
+  echo "[bookget wrapper] using Shanghai Library PDF fallback downloader..." >&2
+  "$helper" --shl-download --url "$url" --out-dir "$target_output_dir"
+}
+
+url_host_key() {
+  local url="$1"
+  local host
+
+  # zsh doesn't support bash's "declare -n", so keep this function pure zsh.
+  # Extract host from URL without sed/backrefs to avoid BSD sed quirks.
+  host="${url#*://}"
+  host="${host%%/*}"
+  host="${host%%:*}"
+  print -r -- "$host"
+}
+
+apply_auto_cookie_override_to_args() {
+  local url="$1"
+  local args_name="$2"
+  local host cookie_file parent
+
+  host="$(url_host_key "$url")"
+  [[ -n "$host" ]] || return 0
+  cookie_file="${AUTO_COOKIE_BY_HOST[$host]:-}"
+  if [[ -z "$cookie_file" || ! -f "$cookie_file" ]]; then
+    parent="$(parent_domain_key "$host")"
+    if [[ -n "$parent" && -n "${AUTO_COOKIE_BY_HOST[$parent]:-}" ]]; then
+      cookie_file="${AUTO_COOKIE_BY_HOST[$parent]}"
+    fi
+  fi
+  [[ -n "$cookie_file" && -f "$cookie_file" ]] || return 0
+
+  local -a in out
+  in=("${(@P)args_name}")
+  local j=1
+  while (( j <= ${#in[@]} )); do
+    case "${in[j]}" in
+      -c)
+        (( j++ )) # skip value
+        ;;
+      -c=*)
+        ;;
+      *)
+        out+=("${in[j]}")
+        ;;
+    esac
+    (( j++ ))
+  done
+
+  # Put our auto cookie first to avoid ambiguity if callers also pass -c.
+  set -A "$args_name" "-c" "$cookie_file" "${out[@]}"
+}
+
+apply_capture_interval_to_args() {
+  local args_name="$1"
+  local raw interval
+  local j=1
+
+  raw="${capture_interval_seconds:-}"
+  [[ -n "$raw" ]] || return 0
+  interval="${raw//,/\.}"
+  if [[ "$interval" != <-> && "$interval" != <->.<-> ]]; then
+    return 0
+  fi
+
+  local -a in out
+  in=("${(@P)args_name}")
+  while (( j <= ${#in[@]} )); do
+    case "${in[j]}" in
+      -speed)
+        (( j++ )) # skip value
+        ;;
+      -speed=*)
+        ;;
+      *)
+        out+=("${in[j]}")
+        ;;
+    esac
+    (( j++ ))
+  done
+
+  # Use one unified interval setting for core download pacing.
+  set -A "$args_name" "-speed" "$interval" "${out[@]}"
+}
+
+normalized_capture_interval_value() {
+  local raw interval
+
+  raw="${capture_interval_seconds:-}"
+  [[ -n "$raw" ]] || {
+    print -r -- ""
+    return 0
+  }
+  interval="${raw//,/\.}"
+  if [[ "$interval" == <-> || "$interval" == <->.<-> ]]; then
+    print -r -- "$interval"
+  else
+    print -r -- ""
+  fi
+}
+
+is_positive_interval_value() {
+  local interval="$1"
+  [[ -n "$interval" ]] || return 1
+  [[ "$interval" != "0" && "$interval" != "0.0" ]]
+}
+
+run_core_with_optional_get_interval() {
+  local url="$1"
+  local log_file="$2"
+  local args_name="$3"
+  local interval fifo pid line output_code=0
+  local -a cmd_args
+
+  cmd_args=("${(@P)args_name}")
+  interval="$(normalized_capture_interval_value)"
+
+  if ! is_positive_interval_value "$interval"; then
+    if [[ -n "$log_file" ]]; then
+      "$CORE_BIN" "${cmd_args[@]}" 2>&1 | tee "$log_file"
+      return ${pipestatus[1]}
+    fi
+    "$CORE_BIN" "${cmd_args[@]}"
+    return $?
+  fi
+
+  echo "[bookget wrapper] strict interval mode enabled: ${interval}s after each Get line" >&2
+
+  if [[ -n "$log_file" ]]; then
+    : > "$log_file"
+  fi
+
+  fifo="$(mktemp -u "${TMPDIR:-/tmp}/bookget-stream.XXXXXX" 2>/dev/null)"
+  [[ -n "$fifo" ]] || return 99
+  mkfifo "$fifo" 2>/dev/null || return 99
+
+  "$CORE_BIN" "${cmd_args[@]}" >"$fifo" 2>&1 &
+  pid=$!
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    print -r -- "$line"
+    if [[ -n "$log_file" ]]; then
+      print -r -- "$line" >> "$log_file"
+    fi
+
+    if [[ "$line" == *"Get "*"/"* ]]; then
+      kill -STOP "$pid" >/dev/null 2>&1 || true
+      sleep "$interval"
+      kill -CONT "$pid" >/dev/null 2>&1 || true
+    fi
+  done < "$fifo"
+
+  wait "$pid"
+  output_code=$?
+  rm -f "$fifo"
+  return $output_code
+}
+
+interactive_capture_cookie_for_url() {
+  local url="$1"
+  local host parent helper cookie_file url_out_file rc final_url
+
+  REPLY=""
+  host="$(url_host_key "$url")"
+  [[ -n "$host" ]] || return 1
+
+  helper="$SCRIPT_DIR/bookget-web-login"
+  if [[ ! -x "$helper" ]]; then
+    echo "[bookget wrapper] missing web login helper: $helper" >&2
+    return 1
+  fi
+
+  if [[ -n "${AUTO_LOGIN_TRIED_BY_HOST[$host]:-}" ]]; then
+    return 1
+  fi
+
+  # mktemp on macOS only expands XXXXXX when they appear at the end of the template.
+  cookie_file="$(mktemp "${TMPDIR:-/tmp}/bookget_auto_cookie_${host//[^A-Za-z0-9._-]/_}_XXXXXX" 2>/dev/null)" || {
+    echo "[bookget wrapper] mktemp failed for cookie file (TMPDIR=${TMPDIR:-/tmp})" >&2
+    return 1
+  }
+  AUTO_COOKIE_TEMP_FILES+=("$cookie_file")
+
+  url_out_file="$(mktemp "${TMPDIR:-/tmp}/bookget_auto_url_${host//[^A-Za-z0-9._-]/_}_XXXXXX" 2>/dev/null)" || url_out_file=""
+  if [[ -n "$url_out_file" ]]; then
+    AUTO_COOKIE_TEMP_FILES+=("$url_out_file")
+  fi
+
+  # Only mark as "tried" once we can actually show the window, so transient
+  # filesystem errors (mktemp) don't permanently disable the login prompt.
+  AUTO_LOGIN_TRIED_BY_HOST[$host]=1
+
+  echo "[bookget wrapper] detected login/verification page, opening temporary browser window..." >&2
+  if [[ -n "$url_out_file" ]]; then
+    "$helper" --url "$url" --cookie-out "$cookie_file" --url-out "$url_out_file" >/dev/null
+  else
+    "$helper" --url "$url" --cookie-out "$cookie_file" >/dev/null
+  fi
+  rc=$?
+  if (( rc == 2 )); then
+    echo "[bookget wrapper] login window cancelled (exit=$rc)" >&2
+    return 130
+  fi
+  if (( rc != 0 )); then
+    echo "[bookget wrapper] login window failed (exit=$rc)" >&2
+    return 1
+  fi
+  if [[ ! -s "$cookie_file" ]]; then
+    echo "[bookget wrapper] login state capture returned empty file: $cookie_file" >&2
+    return 1
+  fi
+
+  AUTO_COOKIE_BY_HOST[$host]="$cookie_file"
+  parent="$(parent_domain_key "$host")"
+  if [[ -n "$parent" ]]; then
+    AUTO_COOKIE_BY_HOST[$parent]="$cookie_file"
+  fi
+  echo "[bookget wrapper] login state captured for host: $host" >&2
+
+  final_url=""
+  if [[ -n "$url_out_file" && -f "$url_out_file" ]]; then
+    final_url="$(cat "$url_out_file" 2>/dev/null | head -n 1 | tr -d '\r' | tr -d '\n' || true)"
+    if [[ -n "$final_url" && "$final_url" != http://* && "$final_url" != https://* ]]; then
+      final_url=""
+    fi
+  fi
+  if [[ -n "$final_url" && "$final_url" != "$url" ]]; then
+    echo "[bookget wrapper] login window final URL: $final_url" >&2
+  fi
+  if [[ -n "$final_url" ]]; then
+    AUTO_FINAL_URL_BY_HOST[$host]="$final_url"
+    parent="$(parent_domain_key "$host")"
+    if [[ -n "$parent" ]]; then
+      AUTO_FINAL_URL_BY_HOST[$parent]="$final_url"
+    fi
+  fi
+  REPLY="$final_url"
+  return 0
+}
+
+prelogin_for_url_if_needed() {
+  local url="$1"
+  local host parent
+  local rc
+
+  REPLY=""
+  if ! should_prelogin; then
+    should_force_prelogin_for_url "$url" || return 0
+  fi
+
+  host="$(url_host_key "$url")"
+  [[ -n "$host" ]] || return 0
+  parent="$(parent_domain_key "$host")"
+  if [[ -n "${AUTO_COOKIE_BY_HOST[$host]:-}" || -n "${AUTO_COOKIE_BY_HOST[$parent]:-}" ]]; then
+    REPLY="${AUTO_FINAL_URL_BY_HOST[$host]:-${AUTO_FINAL_URL_BY_HOST[$parent]:-}}"
+    return 0
+  fi
+
+  interactive_capture_cookie_for_url "$url"
+  rc=$?
+  if (( rc != 0 )); then
+    return $rc
+  fi
+  return 0
+}
+
+run_single_url_with_login_retry() {
+  local url="$1"
+  local mode_override="${2:-}"
+  local dzi_override="${3:-}"
+  local code=0
+  local url_work="$url"
+  local retry_url=""
+  local pre_url="" prelogin_rc=0
+  local login_url=""
+  local login_rc=0
+  local resolved_url=""
+
+  prelogin_for_url_if_needed "$url_work"
+  prelogin_rc=$?
+  pre_url="$REPLY"
+  if (( prelogin_rc == 130 )); then
+    return 130
+  fi
+  if (( prelogin_rc != 0 )); then
+    pre_url=""
+  fi
+  if [[ -n "$pre_url" && "$pre_url" != "$url_work" ]]; then
+    url_work="$pre_url"
+  fi
+
+  # After prelogin, cookies may exist; re-resolve entry URL for sites that require auth.
+  resolved_url="$(resolve_special_entry_url "$url_work")"
+  if [[ -n "$resolved_url" && "$resolved_url" != "$url_work" ]]; then
+    echo "[bookget wrapper] resolved site entry URL after prelogin: $resolved_url" >&2
+    url_work="$resolved_url"
+  fi
+
+  if is_shanghai_library_pdfview_url "$url_work"; then
+    run_shanghai_library_pdf_download "$url_work"
+    return $?
+  fi
+
+  run_single_url "$url_work" "$mode_override" "$dzi_override"
+  code=$?
+  if (( code != 95 )); then
+    return $code
+  fi
+
+  # 95 indicates we likely downloaded an HTML login/verification page disguised as content.
+  # Only prompt the temporary login window if the user enabled login/verification.
+  should_prelogin || return $code
+
+  interactive_capture_cookie_for_url "$url_work"
+  login_rc=$?
+  login_url="$REPLY"
+  if (( login_rc == 130 )); then
+    return 130
+  fi
+  if (( login_rc != 0 )); then
+    return $code
+  fi
+  retry_url="$url_work"
+  if [[ -n "$login_url" && "$login_url" != "$retry_url" ]]; then
+    retry_url="$login_url"
+  fi
+
+  resolved_url="$(resolve_special_entry_url "$retry_url")"
+  if [[ -n "$resolved_url" && "$resolved_url" != "$retry_url" ]]; then
+    echo "[bookget wrapper] resolved site entry URL after login: $resolved_url" >&2
+    retry_url="$resolved_url"
+  fi
+  if is_shanghai_library_pdfview_url "$retry_url"; then
+    run_shanghai_library_pdf_download "$retry_url"
+    return $?
+  fi
+  run_single_url "$retry_url" "$mode_override" "$dzi_override"
+  return $?
+}
+
+# Extract URLs from argv to support GUI variants that pass URLs directly.
+idx=1
+while (( idx <= ${#orig_args[@]} )); do
+  arg="${orig_args[idx]}"
+  case "$arg" in
+    -login|-login=*)
+      # Wrapper-only flag; must not be forwarded to bookget-core.
+      ;;
+    -interval)
+      # Wrapper-only flag; skip optional value token as well.
+      if (( idx < ${#orig_args[@]} )) && [[ "${orig_args[idx+1]}" != -* ]]; then
+        (( idx++ ))
+      fi
+      ;;
+    -interval=*)
+      # Wrapper-only flag; must not be forwarded to bookget-core.
+      ;;
+    *)
+      if [[ "$arg" == *"http://"* || "$arg" == *"https://"* ]]; then
+        normalized="${arg//\\n/$'\n'}"
+        normalized="${normalized//,/\\n}"
+        while IFS= read -r token || [[ -n "$token" ]]; do
+          token="$(printf '%s' "$token" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+          [[ -z "$token" ]] && continue
+          if [[ "$token" == http://* || "$token" == https://* ]]; then
+            if [[ -z "${seen_urls[$token]:-}" ]]; then
+              cli_urls+=("$token")
+              seen_urls[$token]=1
+            fi
+          fi
+        done <<< "$(printf '%s\n' "$normalized" | tr '; \t' '\n')"
+      else
+        filtered_args+=("$arg")
+      fi
+      ;;
+  esac
+  (( idx++ ))
+done
+
+create_conflict_output_dir() {
+  local target_dir="$1"
+  local idx=2
+  local candidate=""
+
+  mkdir -p "$target_dir" || return 1
+  candidate="$target_dir/bookget_dup_${idx}"
+  while [[ -e "$candidate" ]]; do
+    (( idx++ ))
+    candidate="$target_dir/bookget_dup_${idx}"
+  done
+
+  mkdir -p "$candidate" || return 1
+  print -r -- "$candidate"
+}
+
+is_obvious_html_payload() {
+  local file_path="$1"
+  local sample
+
+  [[ -f "$file_path" ]] || return 1
+  sample="$(
+    LC_ALL=C dd if="$file_path" bs=1 count=1024 2>/dev/null \
+      | LC_ALL=C tr '\000' ' ' \
+      | LC_ALL=C tr '[:upper:]' '[:lower:]'
+  )"
+  [[ -n "$sample" ]] || return 1
+  printf '%s' "$sample" | grep -Eiq '<!doctype html|<html|<head|<body|<title|<script|<meta[^>]*charset'
+}
+
+is_file_signature_valid() {
+  local file_path="$1"
+  local ext sig
+  ext="${file_path:e:l}"
+  case "$ext" in
+    jpg|jpeg)
+      if is_obvious_html_payload "$file_path"; then
+        return 1
+      fi
+      sig="$(xxd -p -l 3 "$file_path" 2>/dev/null | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+      [[ "$sig" == ffd8ff* ]]
+      return $?
+      ;;
+    png)
+      if is_obvious_html_payload "$file_path"; then
+        return 1
+      fi
+      sig="$(xxd -p -l 8 "$file_path" 2>/dev/null | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+      [[ "$sig" == 89504e470d0a1a0a ]]
+      return $?
+      ;;
+    pdf)
+      if is_obvious_html_payload "$file_path"; then
+        return 1
+      fi
+      sig="$(xxd -p -l 5 "$file_path" 2>/dev/null | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+      [[ "$sig" == 255044462d* ]]
+      return $?
+      ;;
+    tif|tiff)
+      if is_obvious_html_payload "$file_path"; then
+        return 1
+      fi
+      sig="$(xxd -p -l 4 "$file_path" 2>/dev/null | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+      [[ "$sig" == 49492a00* || "$sig" == 4d4d002a* ]]
+      return $?
+      ;;
+    *)
+      # For unknown extensions, still reject obvious HTML error pages.
+      if is_obvious_html_payload "$file_path"; then
+        return 1
+      fi
+      return 0
+      ;;
+  esac
+}
+
+validate_new_files_since_marker() {
+  local dir_path="$1"
+  local marker_file="$2"
+  local src_file found=0
+  local has_invalid=0
+
+  [[ -d "$dir_path" && -f "$marker_file" ]] || return 2
+
+  while IFS= read -r -d '' src_file; do
+    found=1
+    is_file_signature_valid "$src_file" || has_invalid=1
+  done < <(find "$dir_path" -type f -newer "$marker_file" -print0 2>/dev/null)
+
+  if (( found == 0 )); then
+    return 2
+  fi
+  if (( has_invalid == 1 )); then
+    return 3
+  fi
+  return 0
+}
+
+remove_new_files_since_marker() {
+  local dir_path="$1"
+  local marker_file="$2"
+  [[ -d "$dir_path" && -f "$marker_file" ]] || return 0
+  find "$dir_path" -type f -newer "$marker_file" -delete 2>/dev/null || true
+}
+
+remove_empty_dirs_since_marker() {
+  local dir_path="$1"
+  local marker_file="$2"
+  local subdir
+
+  [[ -d "$dir_path" && -f "$marker_file" ]] || return 0
+
+  while IFS= read -r -d '' subdir; do
+    # Keep the user-selected root output directory itself.
+    [[ "$subdir" == "$dir_path" ]] && continue
+    rmdir "$subdir" 2>/dev/null || true
+  done < <(find "$dir_path" -type d -newer "$marker_file" -depth -print0 2>/dev/null)
+}
+
+has_transport_error_in_log() {
+  local log_file="$1"
+  [[ -f "$log_file" ]] || return 1
+
+  grep -Eiq \
+    '(^|[[:space:]])(Get|Post|Head) "[^"]+": (dial tcp|lookup [^:[:space:]]+:[[:space:]]*no such host|no such host|i/o timeout|context deadline exceeded|tls handshake timeout|connection refused|connection reset|no route to host|network is unreachable|server misbehaving|eof)' \
+    "$log_file"
+}
+
+# Conflict fallback: write directly to a renamed output subfolder
+# (bookget_dup_2, bookget_dup_3...) without using temporary merge paths.
+run_single_url_temp_merge() {
+  local url="$1"
+  local mode_override="${2:-}"
+  local dzi_override="${3:-}"
+  local base_output_dir="${4:-}"
+  local tmp_file
+  local log_file
+  local marker_file
+  local conflict_output_dir
+  local patched_output=0
+  local output_code=0
+  local new_status=0
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/bookget-url.XXXXXX")" || return 98
+  print -r -- "$url" > "$tmp_file"
+
+  if [[ -z "$base_output_dir" ]]; then
+    base_output_dir="$output_dir"
+  fi
+  if [[ -z "$base_output_dir" ]]; then
+    base_output_dir="$PWD"
+  fi
+
+  conflict_output_dir="$(create_conflict_output_dir "$base_output_dir")" || {
+    rm -f "$tmp_file"
+    return 97
+  }
+  echo "[bookget wrapper] conflict fallback output dir: $conflict_output_dir" >&2
+
+  marker_file="$(mktemp "${TMPDIR:-/tmp}/bookget-marker.XXXXXX" 2>/dev/null)"
+  if [[ -z "$marker_file" ]]; then
+    rm -f "$tmp_file"
+    return 97
+  fi
+
+  local args=("${filtered_args[@]}")
+  apply_auto_cookie_override_to_args "$url" args
+  apply_capture_interval_to_args args
+  local j=1
+  local patched=0
+  local patched_mode=0
+  local patched_dzi=0
+  while (( j <= ${#args[@]} )); do
+    case "${args[j]}" in
+      -i)
+        if (( j < ${#args[@]} )); then
+          args[j+1]="$tmp_file"
+          patched=1
+          (( j++ ))
+        fi
+        ;;
+      -i=*)
+        args[j]="-i=$tmp_file"
+        patched=1
+        ;;
+      -n)
+        if [[ -n "$max_threads" ]] && (( j < ${#args[@]} )); then
+          args[j+1]="$max_threads"
+          (( j++ ))
+        fi
+        ;;
+      -n=*)
+        if [[ -n "$max_threads" ]]; then
+          args[j]="-n=$max_threads"
+        fi
+        ;;
+      -o)
+        if (( j < ${#args[@]} )); then
+          args[j+1]="$conflict_output_dir"
+          patched_output=1
+          (( j++ ))
+        fi
+        ;;
+      -o=*)
+        args[j]="-o=$conflict_output_dir"
+        patched_output=1
+        ;;
+      -a)
+        if [[ -n "$mode_override" ]] && (( j < ${#args[@]} )); then
+          args[j+1]="$mode_override"
+          patched_mode=1
+          (( j++ ))
+        fi
+        ;;
+      -a=*)
+        if [[ -n "$mode_override" ]]; then
+          args[j]="-a=$mode_override"
+          patched_mode=1
+        fi
+        ;;
+      -dzi)
+        if [[ -n "$dzi_override" ]]; then
+          args[j]="-dzi=$dzi_override"
+          patched_dzi=1
+        fi
+        ;;
+      -dzi=*)
+        if [[ -n "$dzi_override" ]]; then
+          args[j]="-dzi=$dzi_override"
+          patched_dzi=1
+        fi
+        ;;
+    esac
+    (( j++ ))
+  done
+
+  if (( patched == 0 )); then
+    args+=("-i" "$tmp_file")
+  fi
+  if (( patched_output == 0 )); then
+    args=("-o" "$conflict_output_dir" "${args[@]}")
+  fi
+  if [[ -n "$mode_override" ]] && (( patched_mode == 0 )); then
+    args=("-a" "$mode_override" "${args[@]}")
+  fi
+  if [[ -n "$dzi_override" ]] && (( patched_dzi == 0 )); then
+    args=("-dzi=$dzi_override" "${args[@]}")
+  fi
+
+  if [[ -n "$mode_override" ]]; then
+    log_file="$(mktemp "${TMPDIR:-/tmp}/bookget-log.XXXXXX")" || {
+      rm -f "$marker_file" "$tmp_file"
+      return 99
+    }
+    run_core_with_optional_get_interval "$url" "$log_file" args
+    output_code=$?
+    if (( output_code == 0 )) && grep -Eiq "Unsupported URL|处理URL失败|task panic recovered|panic: runtime error" "$log_file"; then
+      output_code=99
+    fi
+    if (( output_code == 0 )) && has_transport_error_in_log "$log_file"; then
+      echo "[bookget wrapper] transport/network error detected in downloader log" >&2
+      output_code=96
+    fi
+    rm -f "$log_file"
+  else
+    run_core_with_optional_get_interval "$url" "" args
+    output_code=$?
+  fi
+
+  if (( output_code == 0 )); then
+    validate_new_files_since_marker "$conflict_output_dir" "$marker_file"
+    new_status=$?
+
+    if (( new_status == 3 )); then
+      remove_new_files_since_marker "$conflict_output_dir" "$marker_file"
+      output_code=95
+    elif (( new_status == 2 )); then
+      output_code=98
+    fi
+  fi
+
+  if (( output_code != 0 )); then
+    remove_empty_dirs_since_marker "$conflict_output_dir" "$marker_file"
+  fi
+
+  rm -f "$marker_file" "$tmp_file"
+
+  # Avoid leaving empty bookget_dup_* folders behind when the retry fails.
+  if [[ -n "$conflict_output_dir" && -d "$conflict_output_dir" ]]; then
+    if ! find "$conflict_output_dir" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+      rmdir "$conflict_output_dir" 2>/dev/null || true
+    fi
+  fi
+  return $output_code
+}
+
+# Default strategy: write directly into target output dir so partial files
+# remain visible during pause/stop. If no new file appears (likely name clash),
+# retry once into a renamed direct output folder (bookget_dup_N).
+run_single_url() {
+  local url="$1"
+  local mode_override="${2:-}"
+  local dzi_override="${3:-}"
+  local tmp_file
+  local log_file
+  local marker_file
+  local target_output_dir
+  local patched_output=0
+  local output_code=0
+  local new_status=0
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/bookget-url.XXXXXX")" || return 98
+  print -r -- "$url" > "$tmp_file"
+
+  target_output_dir="$output_dir"
+  if [[ -z "$target_output_dir" ]]; then
+    target_output_dir="$PWD"
+  fi
+  mkdir -p "$target_output_dir" 2>/dev/null || true
+
+  marker_file="$(mktemp "${TMPDIR:-/tmp}/bookget-marker.XXXXXX" 2>/dev/null)"
+  if [[ -z "$marker_file" ]]; then
+    rm -f "$tmp_file"
+    return 97
+  fi
+
+  local args=("${filtered_args[@]}")
+  apply_auto_cookie_override_to_args "$url" args
+  apply_capture_interval_to_args args
+  local j=1
+  local patched=0
+  local patched_mode=0
+  local patched_dzi=0
+  while (( j <= ${#args[@]} )); do
+    case "${args[j]}" in
+      -i)
+        if (( j < ${#args[@]} )); then
+          args[j+1]="$tmp_file"
+          patched=1
+          (( j++ ))
+        fi
+        ;;
+      -i=*)
+        args[j]="-i=$tmp_file"
+        patched=1
+        ;;
+      -n)
+        if [[ -n "$max_threads" ]] && (( j < ${#args[@]} )); then
+          args[j+1]="$max_threads"
+          (( j++ ))
+        fi
+        ;;
+      -n=*)
+        if [[ -n "$max_threads" ]]; then
+          args[j]="-n=$max_threads"
+        fi
+        ;;
+      -o)
+        if (( j < ${#args[@]} )); then
+          args[j+1]="$target_output_dir"
+          patched_output=1
+          (( j++ ))
+        fi
+        ;;
+      -o=*)
+        args[j]="-o=$target_output_dir"
+        patched_output=1
+        ;;
+      -a)
+        if [[ -n "$mode_override" ]] && (( j < ${#args[@]} )); then
+          args[j+1]="$mode_override"
+          patched_mode=1
+          (( j++ ))
+        fi
+        ;;
+      -a=*)
+        if [[ -n "$mode_override" ]]; then
+          args[j]="-a=$mode_override"
+          patched_mode=1
+        fi
+        ;;
+      -dzi)
+        if [[ -n "$dzi_override" ]]; then
+          args[j]="-dzi=$dzi_override"
+          patched_dzi=1
+        fi
+        ;;
+      -dzi=*)
+        if [[ -n "$dzi_override" ]]; then
+          args[j]="-dzi=$dzi_override"
+          patched_dzi=1
+        fi
+        ;;
+    esac
+    (( j++ ))
+  done
+
+  if (( patched == 0 )); then
+    args+=("-i" "$tmp_file")
+  fi
+  if (( patched_output == 0 )); then
+    args=("-o" "$target_output_dir" "${args[@]}")
+  fi
+  if [[ -n "$mode_override" ]] && (( patched_mode == 0 )); then
+    args=("-a" "$mode_override" "${args[@]}")
+  fi
+  if [[ -n "$dzi_override" ]] && (( patched_dzi == 0 )); then
+    args=("-dzi=$dzi_override" "${args[@]}")
+  fi
+
+  if [[ -n "$mode_override" ]]; then
+    log_file="$(mktemp "${TMPDIR:-/tmp}/bookget-log.XXXXXX")" || {
+      rm -f "$marker_file" "$tmp_file"
+      return 99
+    }
+    run_core_with_optional_get_interval "$url" "$log_file" args
+    output_code=$?
+    if (( output_code == 0 )) && grep -Eiq "Unsupported URL|处理URL失败|task panic recovered|panic: runtime error" "$log_file"; then
+      output_code=99
+    fi
+    if (( output_code == 0 )) && has_transport_error_in_log "$log_file"; then
+      echo "[bookget wrapper] transport/network error detected in downloader log" >&2
+      output_code=96
+    fi
+    rm -f "$log_file"
+  else
+    run_core_with_optional_get_interval "$url" "" args
+    output_code=$?
+  fi
+
+  if (( output_code == 0 )); then
+    validate_new_files_since_marker "$target_output_dir" "$marker_file"
+    new_status=$?
+
+    if (( new_status == 3 )); then
+      # Reject HTML/invalid payloads written as images (common for captcha/login pages).
+      remove_new_files_since_marker "$target_output_dir" "$marker_file"
+      output_code=95
+    elif (( new_status == 2 )); then
+      echo "[bookget wrapper] no new visible output, retry with conflict-safe save" >&2
+      run_single_url_temp_merge "$url" "$mode_override" "$dzi_override" "$target_output_dir"
+      output_code=$?
+    fi
+  fi
+
+  if (( output_code != 0 )); then
+    remove_empty_dirs_since_marker "$target_output_dir" "$marker_file"
+  fi
+
+  rm -f "$marker_file" "$tmp_file"
+  return $output_code
+}
+
+run_mode2_with_dzi_fallback() {
+  local url="$1"
+  local mode="2"
+  local code
+
+  if [[ -n "$dzi_choice" ]]; then
+    echo "[bookget wrapper] mode -a 2 using user-selected -dzi=$dzi_choice" >&2
+    run_single_url_with_login_retry "$url" "$mode" "$dzi_choice"
+    return $?
+  fi
+
+  echo "[bookget wrapper] mode -a 2 prefers -dzi=false for progress-style logs" >&2
+  run_single_url_with_login_retry "$url" "$mode" "false"
+  code=$?
+  if (( code == 0 )); then
+    return 0
+  fi
+
+  echo "[bookget wrapper] -a 2 with -dzi=false failed, fallback to -dzi=true" >&2
+  run_single_url_with_login_retry "$url" "$mode" "true"
+  return $?
+}
+
+run_single_url_with_auto_modes() {
+  local original_url="$1"
+  local mode
+  local url_for_mode
+  local resolved_url
+  local code
+
+  if is_ncl_rbook_searchdetail_url "$original_url"; then
+    if should_prelogin; then
+      run_rbook_scrape "$original_url"
+      return $?
+    fi
+    echo "[bookget wrapper] rbook special-case requires login/verification; skipping WebView scrape because -login=0" >&2
+  fi
+
+  for mode in 0 1 2; do
+    url_for_mode="$original_url"
+    if (( mode == 2 )); then
+      resolved_url="$(resolve_iiif_manifest_url "$original_url")"
+      if [[ -n "$resolved_url" && "$resolved_url" != "$original_url" ]]; then
+        echo "[bookget wrapper] resolved page URL to IIIF manifest: $resolved_url" >&2
+        url_for_mode="$resolved_url"
+      fi
+      echo "[bookget wrapper] auto mode try -a $mode: $url_for_mode" >&2
+      run_mode2_with_dzi_fallback "$url_for_mode"
+      code=$?
+      if (( code == 130 )); then
+        return 130
+      fi
+      if (( code == 96 )); then
+        echo "[bookget wrapper] detected transport/network errors; skip remaining auto modes" >&2
+        return 96
+      fi
+      if (( code == 0 )); then
+        return 0
+      fi
+      echo "[bookget wrapper] auto mode -a $mode failed for: $original_url (exit=$code)" >&2
+      continue
+    fi
+
+    echo "[bookget wrapper] auto mode try -a $mode: $url_for_mode" >&2
+    run_single_url_with_login_retry "$url_for_mode" "$mode"
+    code=$?
+    if (( code == 130 )); then
+      return 130
+    fi
+    if (( code == 96 )); then
+      echo "[bookget wrapper] detected transport/network errors; skip remaining auto modes" >&2
+      return 96
+    fi
+    if (( code == 0 )); then
+      return 0
+    fi
+    echo "[bookget wrapper] auto mode -a $mode failed for: $original_url (exit=$code)" >&2
+  done
+
+  return 1
+}
+
+urls=()
+load_urls_from_file() {
+  local file_path="$1"
+  [[ -f "$file_path" ]] || return 0
+  local raw url
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    url="${raw%%#*}"
+    url="${url//$'\r'/}"
+    url="$(printf '%s' "$url" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [[ -z "$url" ]] && continue
+    if [[ -z "${seen_urls[$url]:-}" ]]; then
+      urls+=("$url")
+      seen_urls[$url]=1
+    fi
+  done < "$file_path"
+}
+
+is_http_url() {
+  local url="$1"
+  [[ "$url" == http://* || "$url" == https://* ]]
+}
+
+is_probable_iiif_manifest_url() {
+  local url="$1"
+  local lc="${url:l}"
+  [[ "$lc" == *":manifest"* || "$lc" == *"manifest.json"* || "$lc" == *"/manifest"* || "$lc" == *"iiif"*"/manifest"* ]]
+}
+
+normalize_manifest_candidate_url() {
+  local base_url="$1"
+  local candidate="$2"
+  local origin scheme path_no_query base_dir
+
+  candidate="${candidate//&amp;/&}"
+  candidate="${candidate//\\u0026/&}"
+  candidate="${candidate//\\/\/}"
+
+  if [[ "$candidate" == http://* || "$candidate" == https://* ]]; then
+    print -r -- "$candidate"
+    return 0
+  fi
+
+  if [[ "$candidate" == //* ]]; then
+    scheme="$(printf '%s' "$base_url" | sed -E 's#^(https?)://.*#\1#')"
+    if [[ -n "$scheme" && "$scheme" != "$base_url" ]]; then
+      print -r -- "${scheme}:${candidate}"
+      return 0
+    fi
+  fi
+
+  origin="$(printf '%s' "$base_url" | sed -E 's#^(https?://[^/]+).*$#\1#')"
+  if [[ "$origin" == "$base_url" ]]; then
+    print -r -- "$candidate"
+    return 0
+  fi
+
+  if [[ "$candidate" == /* ]]; then
+    print -r -- "${origin}${candidate}"
+    return 0
+  fi
+
+  path_no_query="${base_url%%\?*}"
+  path_no_query="${path_no_query%%\#*}"
+  base_dir="${path_no_query%/*}"
+  if [[ -z "$base_dir" || "$base_dir" == "$path_no_query" ]]; then
+    base_dir="$origin"
+  fi
+  print -r -- "${base_dir}/${candidate}"
+}
+
+extract_manifest_candidate_from_page() {
+  local page="$1"
+  local raw
+
+  # Common pattern used by many collections UIs.
+  raw="$(printf '%s\n' "$page" | sed -n "s/.*copyManifestToClipBoard(['\"]\\([^'\"]*\\)['\"]).*/\\1/p" | head -n 1)"
+  if [[ -n "$raw" ]]; then
+    print -r -- "$raw"
+    return 0
+  fi
+
+  # Absolute candidates.
+  raw="$(printf '%s\n' "$page" | grep -Eo "https?://[^\"'[:space:]]*:MANIFEST|https?://[^\"'[:space:]]*manifest\\.json[^\"'[:space:]]*|https?://[^\"'[:space:]]*/manifest[^\"'[:space:]]*" | head -n 1)"
+  if [[ -n "$raw" ]]; then
+    print -r -- "$raw"
+    return 0
+  fi
+
+  # Relative candidates in html attributes.
+  raw="$(printf '%s\n' "$page" | grep -Eoi "(href|content|data-iiif-manifest|data-manifest|iiif-manifest)=[\"'][^\"']*(manifest\\.json|:MANIFEST|/manifest[^\"']*)[^\"']*[\"']" | sed -E "s/^[^=]*=['\"]//; s/['\"]$//" | head -n 1)"
+  if [[ -n "$raw" ]]; then
+    print -r -- "$raw"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_iiif_manifest_url() {
+  local url="$1"
+  local page candidate manifest
+
+  if ! is_http_url "$url"; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  if is_probable_iiif_manifest_url "$url"; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  page="$(curl -fsSL -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" --connect-timeout 15 --max-time 45 "$url" 2>/dev/null)" || {
+    print -r -- "$url"
+    return 0
+  }
+
+  candidate="$(extract_manifest_candidate_from_page "$page" || true)"
+  if [[ -n "$candidate" ]]; then
+    manifest="$(normalize_manifest_candidate_url "$url" "$candidate")"
+  fi
+
+  if [[ -n "$manifest" ]]; then
+    print -r -- "$manifest"
+  else
+    print -r -- "$url"
+  fi
+}
+
+is_qingarchives_display_url() {
+  local url="$1"
+  local normalized lc
+
+  normalized="$(printf '%s' "$url" | sed -E 's/%2[Ff]/\//g')"
+  lc="${normalized:l}"
+  [[ "$lc" == *"qingarchives.npm.edu.tw/index.php?act=display/image/"* || "$lc" == *"qingarchives.npm.edu.tw/index.php?act=display/print/"* ]]
+}
+
+extract_qingarchives_object_code() {
+  local url="$1"
+  local normalized obj
+
+  normalized="$(printf '%s' "$url" | sed -E 's/%2[Ff]/\//g')"
+  obj="$(printf '%s' "$normalized" | sed -nE 's#.*[?&]act=[Dd][Ii][Ss][Pp][Ll][Aa][Yy]/([Ii][Mm][Aa][Gg][Ee]|[Pp][Rr][Ii][Nn][Tt])/([^&#]+).*#\2#p' | head -n 1)"
+  print -r -- "$obj"
+}
+
+extract_qingarchives_page_code() {
+  local url="$1"
+  local page
+
+  if [[ "$url" == *"#"* ]]; then
+    page="${url##*#}"
+    page="$(printf '%s' "$page" | sed -E 's/[^A-Za-z0-9].*$//')"
+    print -r -- "$page"
+    return 0
+  fi
+
+  print -r -- ""
+}
+
+rename_qingarchives_php_images_since_marker() {
+  local dir_path="$1"
+  local marker_file="$2"
+  local src_file sig dst base idx
+
+  [[ -d "$dir_path" && -f "$marker_file" ]] || return 0
+
+  while IFS= read -r -d '' src_file; do
+    [[ "${src_file:e:l}" == "php" ]] || continue
+    sig="$(xxd -p -l 3 "$src_file" 2>/dev/null | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+    [[ "$sig" == ffd8ff* ]] || continue
+
+    base="${src_file%.*}"
+    dst="${base}.jpg"
+    if [[ -e "$dst" ]]; then
+      idx=2
+      while [[ -e "${base}_${idx}.jpg" ]]; do
+        (( idx++ ))
+      done
+      dst="${base}_${idx}.jpg"
+    fi
+    mv "$src_file" "$dst" 2>/dev/null || true
+  done < <(find "$dir_path" -type f -name '*.php' -newer "$marker_file" -print0 2>/dev/null)
+}
+
+run_qingarchives_display_download() {
+  local entry_url="$1"
+  local entry_no_hash object_code page_code
+  local base_url="https://qingarchives.npm.edu.tw/"
+  local landing_url="${base_url}index.php?act=Landing/index"
+  local api_url="${base_url}index.php"
+  local ua="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+  local cookie_file url_list_file target_output_dir
+  local response page_list_body page_code_value page_access_lock=""
+  local new_status="" total_pages=""
+  local -a in
+  local j=1
+  local has_n=0
+  local wrote_any=0
+  local effective_threads=""
+  local retries=3
+  local interval=""
+  local task_file fail_file download_dir safe_obj raw_name file_name final_file
+  local idx=0 task_count=0 pending_count=0 skipped_existing=0
+
+  object_code="$(extract_qingarchives_object_code "$entry_url")"
+  if [[ -z "$object_code" ]]; then
+    echo "[bookget wrapper] qingarchives special-case: failed to parse object code" >&2
+    return 94
+  fi
+
+  page_code="$(extract_qingarchives_page_code "$entry_url")"
+  entry_no_hash="${entry_url%%#*}"
+
+  cookie_file="$(mktemp "${TMPDIR:-/tmp}/bookget-qing-cookie.XXXXXX" 2>/dev/null)" || return 98
+  url_list_file="$(mktemp "${TMPDIR:-/tmp}/bookget-qing-urls.XXXXXX" 2>/dev/null)" || {
+    rm -f "$cookie_file"
+    return 98
+  }
+  AUTO_COOKIE_TEMP_FILES+=("$cookie_file" "$url_list_file")
+
+  curl -fsSL -A "$ua" -c "$cookie_file" -b "$cookie_file" "$landing_url" >/dev/null 2>&1 || {
+    echo "[bookget wrapper] qingarchives special-case: failed to initialize session" >&2
+    return 96
+  }
+  curl -fsSL -A "$ua" -e "$landing_url" -c "$cookie_file" -b "$cookie_file" "$entry_no_hash" >/dev/null 2>&1 || {
+    echo "[bookget wrapper] qingarchives special-case: failed to open entry page" >&2
+    return 96
+  }
+
+  response="$(curl -fsSL -A "$ua" -e "$entry_no_hash" -c "$cookie_file" -b "$cookie_file" -X POST "$api_url" --data-urlencode "act=Display/built/${object_code}/${page_code}/jpg" 2>/dev/null)" || {
+    echo "[bookget wrapper] qingarchives special-case: failed to query page list API" >&2
+    return 96
+  }
+  if [[ -z "$response" ]] || ! printf '%s' "$response" | grep -Eq '"action"[[:space:]]*:[[:space:]]*1'; then
+    echo "[bookget wrapper] qingarchives special-case: API rejected access or returned invalid payload" >&2
+    return 95
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    page_access_lock="$(printf '%s' "$response" | jq -r '.data.page_access_lock // ""' 2>/dev/null || true)"
+    while IFS=$'\t' read -r page_code_value page_code_name; do
+      [[ -n "$page_code_value" ]] || continue
+      printf '%s\t%s\n' "$page_code_value" "$page_code_name" >> "$url_list_file"
+      wrote_any=1
+    done < <(printf '%s' "$response" | jq -r '.data.page_list as $pl | .data.page_thumb as $pt | if ($pl|type)=="object" then ($pl|to_entries[] | [.value, ($pt[.key] // "")] | @tsv) else empty end' 2>/dev/null)
+  else
+    page_access_lock="$(printf '%s' "$response" | sed -nE 's/.*"page_access_lock"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' | head -n 1)"
+    page_list_body="$(printf '%s' "$response" | sed -n 's/.*"page_list":{\(.*\)},"page_thumb".*/\1/p')"
+    while IFS= read -r page_code_value; do
+      [[ -n "$page_code_value" ]] || continue
+      printf '%s\t%s\n' "$page_code_value" "" >> "$url_list_file"
+      wrote_any=1
+    done < <(printf '%s\n' "$page_list_body" | grep -Eo ':"[^"]+"' | sed -E 's/^:"([^"]+)"$/\1/')
+  fi
+
+  if [[ -n "$page_access_lock" && "$page_access_lock" != "0" ]]; then
+    echo "[bookget wrapper] qingarchives special-case: page access is locked by site-side verification" >&2
+    return 95
+  fi
+  if (( wrote_any == 0 )); then
+    echo "[bookget wrapper] qingarchives special-case: no page codes extracted" >&2
+    return 98
+  fi
+
+  total_pages="$(wc -l < "$url_list_file" | tr -d '[:space:]')"
+  echo "[bookget wrapper] qingarchives special-case: extracted ${total_pages} page codes" >&2
+
+  target_output_dir="$output_dir"
+  if [[ -z "$target_output_dir" ]]; then
+    target_output_dir="$PWD"
+  fi
+  mkdir -p "$target_output_dir" 2>/dev/null || true
+  marker_file=""
+
+  in=("${filtered_args[@]}")
+  while (( j <= ${#in[@]} )); do
+    case "${in[j]}" in
+      -r)
+        if (( j < ${#in[@]} )); then
+          if [[ "${in[j+1]}" == <-> ]]; then
+            retries="${in[j+1]}"
+          fi
+          (( j++ ))
+        fi
+        ;;
+      -n)
+        if (( j < ${#in[@]} )); then
+          if [[ -n "$max_threads" ]]; then
+            effective_threads="$max_threads"
+          else
+            effective_threads="${in[j+1]}"
+          fi
+          has_n=1
+          (( j++ ))
+        fi
+        ;;
+      -n=*)
+        if [[ -n "$max_threads" ]]; then
+          effective_threads="$max_threads"
+        else
+          effective_threads="${in[j]#-n=}"
+        fi
+        has_n=1
+        ;;
+      -r=*)
+        if [[ "${in[j]#-r=}" == <-> ]]; then
+          retries="${in[j]#-r=}"
+        fi
+        ;;
+    esac
+    (( j++ ))
+  done
+  if [[ -n "$max_threads" ]] && (( has_n == 0 )); then
+    effective_threads="$max_threads"
+  fi
+
+  if [[ -z "$effective_threads" ]] || [[ "$effective_threads" != <-> ]]; then
+    effective_threads="2"
+  fi
+  if (( effective_threads < 1 )); then
+    effective_threads="1"
+  fi
+  if (( effective_threads > 8 )); then
+    effective_threads="8"
+  fi
+  if (( retries < 0 )); then
+    retries=0
+  fi
+  if (( retries > 8 )); then
+    retries=8
+  fi
+
+  interval="$(normalized_capture_interval_value)"
+  if ! is_positive_interval_value "$interval"; then
+    interval=""
+  fi
+
+  safe_obj="${object_code//[^A-Za-z0-9._-]/_}"
+  download_dir="$target_output_dir/qingarchives.npm.edu.tw_${safe_obj}"
+  if [[ -e "$download_dir" && ! -d "$download_dir" ]]; then
+    download_dir="${download_dir}_$(date +%Y%m%d_%H%M%S)"
+  fi
+  mkdir -p "$download_dir" 2>/dev/null || {
+    echo "[bookget wrapper] qingarchives special-case: cannot create output dir: $download_dir" >&2
+    return 97
+  }
+  echo "[bookget wrapper] qingarchives special-case: output dir: $download_dir" >&2
+
+  task_file="$(mktemp "${TMPDIR:-/tmp}/bookget-qing-tasks.XXXXXX" 2>/dev/null)" || return 98
+  fail_file="$(mktemp "${TMPDIR:-/tmp}/bookget-qing-fail.XXXXXX" 2>/dev/null)" || {
+    rm -f "$task_file"
+    return 98
+  }
+  AUTO_COOKIE_TEMP_FILES+=("$task_file" "$fail_file")
+  : > "$fail_file"
+
+  while IFS=$'\t' read -r page_code_value raw_name; do
+    [[ -n "$page_code_value" ]] || continue
+    (( idx++ ))
+    file_name="${raw_name:-}"
+    if [[ -z "$file_name" ]]; then
+      file_name="$(printf '%04d.jpg' "$idx")"
+    fi
+    file_name="${file_name//$'\r'/}"
+    file_name="${file_name//\//_}"
+    file_name="${file_name//:/_}"
+    file_name="${file_name//\\/_}"
+    if [[ "${file_name:l}" != *.jpg ]]; then
+      file_name="${file_name%.*}.jpg"
+    fi
+    file_name="$(printf '%04d_%s' "$idx" "$file_name")"
+    final_file="$download_dir/$file_name"
+    if [[ -f "$final_file" ]]; then
+      if is_file_signature_valid "$final_file"; then
+        (( skipped_existing++ ))
+        continue
+      fi
+      rm -f "$final_file" 2>/dev/null || true
+    fi
+    printf '%s\t%s\t%s\n' "$idx" "$page_code_value" "$file_name" >> "$task_file"
+  done < "$url_list_file"
+
+  pending_count="$(wc -l < "$task_file" | tr -d '[:space:]')"
+  if [[ -z "$pending_count" ]]; then
+    pending_count="0"
+  fi
+  task_count="$total_pages"
+  if [[ -n "$skipped_existing" && "$skipped_existing" != "0" ]]; then
+    echo "[bookget wrapper] qingarchives special-case: resume detected, skip existing pages: ${skipped_existing}" >&2
+  fi
+  if [[ "$pending_count" == "0" ]]; then
+    echo "$(date '+%Y/%m/%d %H:%M:%S') Download complete."
+    return 0
+  fi
+
+  qing_download_one() {
+    local task_idx="$1"
+    local code="$2"
+    local out_name="$3"
+    local url tmp_file final_file sig
+    local attempt=0
+    local ok=0
+    local total_attempts=$(( retries + 1 ))
+
+    url="${base_url}index.php?act=Display/loadimg/${object_code}/${code}"
+    final_file="$download_dir/$out_name"
+    tmp_file="$download_dir/.${out_name}.part.$$.$RANDOM"
+
+    while (( attempt < total_attempts )); do
+      (( attempt++ ))
+      echo "$(date '+%Y/%m/%d %H:%M:%S') Get ${task_idx}/${task_count}  ${url}"
+      if curl -fsSL -A "$ua" -e "$entry_no_hash" -b "$cookie_file" --connect-timeout 20 --max-time 180 "$url" -o "$tmp_file" 2>/dev/null; then
+        sig="$(xxd -p -l 3 "$tmp_file" 2>/dev/null | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+        if [[ "$sig" == ffd8ff* ]]; then
+          mv "$tmp_file" "$final_file" 2>/dev/null || {
+            rm -f "$tmp_file"
+            echo "${task_idx}\t${code}\tmv_failed" >> "$fail_file"
+            return 1
+          }
+          ok=1
+          break
+        fi
+      fi
+
+      rm -f "$tmp_file" 2>/dev/null || true
+      if (( attempt < total_attempts )); then
+        sleep 1
+      fi
+    done
+
+    if (( ok == 0 )); then
+      echo "${task_idx}\t${code}\tinvalid_payload" >> "$fail_file"
+      return 1
+    fi
+
+    if [[ -n "$interval" ]]; then
+      sleep "$interval"
+    fi
+    return 0
+  }
+
+  if (( effective_threads <= 1 )); then
+    while IFS=$'\t' read -r idx page_code_value file_name; do
+      qing_download_one "$idx" "$page_code_value" "$file_name" || true
+    done < "$task_file"
+  else
+    local -a qing_pids
+    while IFS=$'\t' read -r idx page_code_value file_name; do
+      qing_download_one "$idx" "$page_code_value" "$file_name" &
+      qing_pids+=("$!")
+      if (( ${#qing_pids[@]} >= effective_threads )); then
+        wait "${qing_pids[1]}" || true
+        qing_pids=("${qing_pids[@]:1}")
+      fi
+    done < "$task_file"
+    local pid
+    for pid in "${qing_pids[@]}"; do
+      wait "$pid" || true
+    done
+  fi
+
+  if [[ -s "$fail_file" ]]; then
+    new_status="$(wc -l < "$fail_file" | tr -d '[:space:]')"
+    echo "[bookget wrapper] qingarchives special-case: failed pages: $new_status" >&2
+    return 95
+  fi
+
+  echo "$(date '+%Y/%m/%d %H:%M:%S') Download complete."
+  return 0
+}
+
+get_cookie_file_from_filtered_args() {
+  local args=("${filtered_args[@]}")
+  local j=1
+  local cookie_file=""
+
+  while (( j <= ${#args[@]} )); do
+    case "${args[j]}" in
+      -c)
+        if (( j < ${#args[@]} )); then
+          cookie_file="${args[j+1]}"
+          (( j++ ))
+        fi
+        ;;
+      -c=*)
+        cookie_file="${args[j]#-c=}"
+        ;;
+    esac
+    (( j++ ))
+  done
+
+  print -r -- "$cookie_file"
+}
+
+build_cookie_header_from_file() {
+  local cookie_file="$1"
+  local host_filter="${2:-}"
+  [[ -n "$cookie_file" && -f "$cookie_file" ]] || {
+    print -r -- ""
+    return 0
+  }
+
+  awk -F '\t' -v host="$host_filter" '
+    function lcase(s) { return tolower(s) }
+    function strip_http_only(s) { sub(/^#HttpOnly_/, "", s); return s }
+    function strip_leading_dot(s) { sub(/^\./, "", s); return s }
+    function host_matches_domain(h, d,    hl, dl, lh, ld, start) {
+      if (h == "" || d == "") return 1
+      hl = lcase(h)
+      dl = lcase(d)
+      lh = length(hl)
+      ld = length(dl)
+      if (hl == dl) return 1
+      if (lh <= ld) return 0
+      if (substr(hl, lh-ld+1) != dl) return 0
+      if (substr(hl, lh-ld, 1) != ".") return 0
+      return 1
+    }
+    {
+      # Skip comments, but keep Netscape HTTPOnly cookie lines starting with "#HttpOnly_".
+      if ($1 ~ /^#/ && $1 !~ /^#HttpOnly_/) next
+      if (NF < 7) next
+
+      domain = strip_leading_dot(strip_http_only($1))
+      if (host != "" && !host_matches_domain(host, domain)) next
+
+      name=$6
+      value=$7
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (name != "") {
+        if (out != "") out = out "; "
+        out = out name "=" value
+      }
+    }
+    END { print out }
+  ' "$cookie_file"
+}
+
+is_ncl_rbook_searchdetail_url() {
+  local url="$1"
+  local lc="${url:l}"
+  [[ "$lc" == *"rbook.ncl.edu.tw/nclsearch/search/searchdetail"* ]]
+}
+
+extract_query_param() {
+  local url="$1"
+  local key="$2"
+  local query part k v
+  query="${url#*\?}"
+  query="${query%%\#*}"
+  if [[ "$query" == "$url" ]]; then
+    return 1
+  fi
+  local IFS='&'
+  for part in $query; do
+    k="${part%%=*}"
+    v=""
+    if [[ "$part" == *"="* ]]; then
+      v="${part#*=}"
+    fi
+    if [[ "$k" == "$key" ]]; then
+      print -r -- "$v"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_rbook_scrape() {
+  local url="$1"
+  local helper="$SCRIPT_DIR/bookget-web-login"
+  local base_out="$output_dir"
+  local item short stamp out rc
+
+  if [[ ! -x "$helper" ]]; then
+    echo "[bookget wrapper] missing web login helper: $helper" >&2
+    return 1
+  fi
+
+  if [[ -z "$base_out" ]]; then
+    base_out="$PWD"
+  fi
+  mkdir -p "$base_out" 2>/dev/null || true
+
+  item="$(extract_query_param "$url" "item" || true)"
+  short="$item"
+  if [[ -n "$short" ]]; then
+    short="${short//[^A-Za-z0-9._-]/_}"
+    short="${short[1,12]}"
+  else
+    short="unknown"
+  fi
+  stamp="$(date +%Y%m%d_%H%M%S 2>/dev/null || true)"
+  [[ -n "$stamp" ]] || stamp="now"
+  out="$base_out/rbook_${short}_${stamp}"
+  mkdir -p "$out" 2>/dev/null || true
+
+  local interval="5"
+  if [[ -n "${capture_interval_seconds:-}" ]]; then
+    local raw="${capture_interval_seconds//,/\.}"
+    if [[ "$raw" == <-> || "$raw" == <->.<-> ]]; then
+      interval="$raw"
+    fi
+  fi
+
+  echo "[bookget wrapper] rbook special-case: using WebView scrape into: $out (capture-interval=${interval}s)" >&2
+  local old_term_trap old_int_trap pid
+  old_term_trap="$(trap -p TERM 2>/dev/null || true)"
+  old_int_trap="$(trap -p INT 2>/dev/null || true)"
+
+  "$helper" --rbook-scrape --url "$url" --out-dir "$out" --interval "$interval" >/dev/null &
+  pid=$!
+  trap "kill -TERM $pid 2>/dev/null || true" TERM
+  trap "kill -TERM $pid 2>/dev/null || true" INT
+  wait $pid
+  rc=$?
+
+  if [[ -n "$old_term_trap" ]]; then
+    eval "$old_term_trap"
+  else
+    trap - TERM
+  fi
+  if [[ -n "$old_int_trap" ]]; then
+    eval "$old_int_trap"
+  else
+    trap - INT
+  fi
+
+  if (( rc == 2 )); then
+    return 130
+  fi
+  return $rc
+}
+
+extract_ncl_view_candidate_from_page() {
+  local page="$1"
+  local raw
+
+  raw="$(printf '%s\n' "$page" | grep -Eo "https?://[^\"'[:space:]]*taiwanebook\\.ncl\\.edu\\.tw[^\"'[:space:]]*book/book/view\\.do[^\"'[:space:]]*" | head -n 1)"
+  if [[ -n "$raw" ]]; then
+    print -r -- "$raw"
+    return 0
+  fi
+
+  raw="$(printf '%s\n' "$page" | grep -Eoi "(href|content|data-url|url)=[\"'][^\"']*book/book/view\\.do[^\"']*[\"']" | sed -E "s/^[^=]*=['\"]//; s/['\"]$//" | head -n 1)"
+  if [[ -n "$raw" ]]; then
+    print -r -- "$raw"
+    return 0
+  fi
+
+  raw="$(printf '%s\n' "$page" | grep -Eo "/(zh-tw/)?book/book/view\\.do[^\"'[:space:]]*" | head -n 1)"
+  if [[ -n "$raw" ]]; then
+    print -r -- "$raw"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_ncl_rbook_url() {
+  local url="$1"
+  local page candidate resolved cookie_file cookie_header
+  local curl_args
+  local tmpd url_file marker_file fetched_file
+
+  if ! is_ncl_rbook_searchdetail_url "$url"; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    : # still attempt core-based fetch below
+  fi
+
+  cookie_file="$(get_cookie_file_from_filtered_args)"
+  # If we already captured cookies via the interactive WKWebView helper,
+  # prefer them for special-page resolution (curl/core HTML fetch).
+  if [[ -z "$cookie_file" || ! -f "$cookie_file" ]]; then
+    local host_key
+    host_key="$(url_host_key "$url")"
+    if [[ -n "$host_key" && -n "${AUTO_COOKIE_BY_HOST[$host_key]:-}" ]]; then
+      cookie_file="${AUTO_COOKIE_BY_HOST[$host_key]}"
+    fi
+  fi
+  cookie_header="$(build_cookie_header_from_file "$cookie_file" "$(url_host_key "$url")")"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl_args=(
+      -fsSL
+      -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+      --connect-timeout 12
+      --max-time 20
+    )
+    if [[ -n "$cookie_header" ]]; then
+      curl_args+=(-H "Cookie: $cookie_header")
+    fi
+    curl_args+=("$url")
+    page="$(curl "${curl_args[@]}" 2>/dev/null)" || page=""
+  fi
+
+  # Fallback: use bookget-core itself to fetch the entry page HTML (works even when curl is blocked).
+  if [[ -z "$page" ]]; then
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/bookget-rbook-resolve.XXXXXX" 2>/dev/null)" || tmpd=""
+    if [[ -n "$tmpd" ]]; then
+      url_file="$(mktemp "$tmpd/url.XXXXXX" 2>/dev/null || true)"
+      marker_file="$(mktemp "$tmpd/.marker.XXXXXX" 2>/dev/null || true)"
+      if [[ -n "$url_file" ]]; then
+        print -r -- "$url" > "$url_file"
+        # Only keep args that help fetching: ua/cookie/localStorage/retries/speed, but override -a/-o/-i/-ext.
+        local args=("${filtered_args[@]}")
+        apply_auto_cookie_override_to_args "$url" args
+        apply_capture_interval_to_args args
+        local j=1
+        local patched_i=0 patched_o=0 patched_a=0 patched_ext=0
+        while (( j <= ${#args[@]} )); do
+          case "${args[j]}" in
+            -i)
+              if (( j < ${#args[@]} )); then
+                args[j+1]="$url_file"
+                patched_i=1
+                (( j++ ))
+              fi
+              ;;
+            -i=*)
+              args[j]="-i=$url_file"
+              patched_i=1
+              ;;
+            -o)
+              if (( j < ${#args[@]} )); then
+                args[j+1]="$tmpd"
+                patched_o=1
+                (( j++ ))
+              fi
+              ;;
+            -o=*)
+              args[j]="-o=$tmpd"
+              patched_o=1
+              ;;
+            -a)
+              if (( j < ${#args[@]} )); then
+                args[j+1]="1"
+                patched_a=1
+                (( j++ ))
+              fi
+              ;;
+            -a=*)
+              args[j]="-a=1"
+              patched_a=1
+              ;;
+            -ext)
+              if (( j < ${#args[@]} )); then
+                args[j+1]=".html"
+                patched_ext=1
+                (( j++ ))
+              fi
+              ;;
+            -ext=*)
+              args[j]="-ext=.html"
+              patched_ext=1
+              ;;
+          esac
+          (( j++ ))
+        done
+        if (( patched_i == 0 )); then
+          args+=("-i" "$url_file")
+        fi
+        if (( patched_o == 0 )); then
+          args=("-o" "$tmpd" "${args[@]}")
+        fi
+        if (( patched_a == 0 )); then
+          args=("-a" "1" "${args[@]}")
+        fi
+        if (( patched_ext == 0 )); then
+          args=("-ext" ".html" "${args[@]}")
+        fi
+
+        "$CORE_BIN" "${args[@]}" >/dev/null 2>&1 || true
+        fetched_file="$(find "$tmpd" -type f -newer "$marker_file" 2>/dev/null | head -n 1)"
+        if [[ -n "$fetched_file" && -f "$fetched_file" ]]; then
+          page="$(cat "$fetched_file" 2>/dev/null || true)"
+        fi
+      fi
+      rm -rf "$tmpd" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ -z "$page" ]]; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  candidate="$(extract_ncl_view_candidate_from_page "$page" || true)"
+  if [[ -n "$candidate" ]]; then
+    resolved="$(normalize_manifest_candidate_url "$url" "$candidate")"
+    if [[ "$resolved" == /* ]]; then
+      resolved="https://taiwanebook.ncl.edu.tw${resolved}"
+    fi
+    if [[ -n "$resolved" ]]; then
+      print -r -- "$resolved"
+      return 0
+    fi
+  fi
+
+  print -r -- "$url"
+}
+
+is_npm_digitalarchive_detail_url() {
+  local url="$1"
+  local lc="${url:l}"
+  [[ "$lc" == *"digitalarchive.npm.gov.tw/collection/detail/"* ]]
+}
+
+resolve_npm_digitalarchive_manifest_url() {
+  local url="$1"
+  local cid dep manifest
+
+  if ! is_npm_digitalarchive_detail_url "$url"; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  cid="$(printf '%s' "$url" | sed -nE 's#.*[Cc]ollection/[Dd]etail/([0-9]+).*#\1#p' | head -n 1)"
+  dep="$(printf '%s' "$url" | sed -nE 's#.*[?&][Dd][Ee][Pp]=([^&#]+).*#\1#p' | head -n 1)"
+  dep="${dep%%[^A-Za-z0-9._-]*}"
+  if [[ -z "$dep" ]]; then
+    dep="P"
+  fi
+  if [[ -z "$cid" ]]; then
+    print -r -- "$url"
+    return 0
+  fi
+
+  manifest="https://digitalarchive.npm.gov.tw/Integrate/GetJson?cid=${cid}&dept=${dep}"
+  print -r -- "$manifest"
+}
+
+resolve_special_entry_url() {
+  local url="$1"
+  local resolved
+
+  resolved="$(resolve_ncl_rbook_url "$url")"
+  if [[ -z "$resolved" ]]; then
+    resolved="$url"
+  fi
+
+  resolved="$(resolve_npm_digitalarchive_manifest_url "$resolved")"
+  if [[ -z "$resolved" ]]; then
+    resolved="$url"
+  fi
+
+  print -r -- "$resolved"
+}
+
+read_wrapper_dzi_choice_from_config() {
+  local config_path="$SCRIPT_DIR/config.ini"
+  local raw=""
+  [[ -f "$config_path" ]] || {
+    print -r -- ""
+    return 0
+  }
+
+  raw="$(
+    awk '
+      BEGIN { in_dzi = 0 }
+      /^[[:space:]]*\[/ {
+        in_dzi = ($0 ~ /^[[:space:]]*\[dzi\][[:space:]]*$/)
+      }
+      in_dzi && /^[[:space:]]*mode[[:space:]]*=/ {
+        sub(/^[^=]*=/, "", $0)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+        gsub(/^"/, "", $0)
+        gsub(/"$/, "", $0)
+        print tolower($0)
+        exit
+      }
+    ' "$config_path"
+  )"
+
+  case "$raw" in
+    1|true|yes|on)   print -r -- "true" ;;
+    0|false|no|off)  print -r -- "false" ;;
+    *)               print -r -- "" ;;
+  esac
+}
+
+# Priority:
+# 1) URLs from -i file.
+# 2) URLs passed directly in argv.
+# 3) Default urls.txt as fallback for GUI variants.
+if [[ -n "$input_file" ]]; then
+  load_urls_from_file "$input_file"
+fi
+if (( ${#urls[@]} == 0 )) && (( ${#cli_urls[@]} > 0 )); then
+  urls=("${cli_urls[@]}")
+fi
+if (( ${#urls[@]} <= 1 )) && (( ${#cli_urls[@]} > 1 )); then
+  urls=("${cli_urls[@]}")
+fi
+if (( ${#urls[@]} <= 1 )); then
+  load_urls_from_file "$default_cwd_urls_file"
+fi
+if (( ${#urls[@]} <= 1 )); then
+  load_urls_from_file "$default_urls_file"
+fi
+
+if (( dzi_explicit == 0 )); then
+  dzi_choice="$(read_wrapper_dzi_choice_from_config)"
+fi
+
+if (( ${#urls[@]} <= 1 )); then
+  if (( ${#urls[@]} == 1 )); then
+    # rbook.ncl.edu.tw SearchDetail is not supported by bookget-core; always use the WebView scrape helper
+    # when login/verification popups are enabled, even if advanced params (-a/-speed/...) are set.
+    if is_ncl_rbook_searchdetail_url "${urls[1]}"; then
+      if should_prelogin; then
+        run_rbook_scrape "${urls[1]}"
+        exit $?
+      fi
+      echo "[bookget wrapper] rbook SearchDetail requires login/verification popup; skipping because -login=0" >&2
+      exit 95
+    fi
+
+    if is_qingarchives_display_url "${urls[1]}"; then
+      run_qingarchives_display_download "${urls[1]}"
+      exit $?
+    fi
+
+    url_effective="$(resolve_special_entry_url "${urls[1]}")"
+    if [[ "$url_effective" != "${urls[1]}" ]]; then
+      echo "[bookget wrapper] resolved site entry URL: $url_effective" >&2
+    fi
+    if (( auto_mode_explicit == 0 )); then
+      run_single_url_with_auto_modes "$url_effective"
+    else
+      run_single_url_with_login_retry "$url_effective" "" "$dzi_choice"
+    fi
+    exit $?
+  fi
+  exec "$CORE_BIN" "${filtered_args[@]}"
+fi
+
+# Multi-URL mode: pick a safer default if caller did not set threads explicitly.
+if [[ -z "$max_threads" ]]; then
+  max_threads="4"
+fi
+
+echo "[bookget wrapper] queued ${#urls[@]} URLs for sequential download" >&2
+
+fail_count=0
+for url in "${urls[@]}"; do
+  if is_qingarchives_display_url "$url"; then
+    echo "[bookget wrapper] start qingarchives special-case: $url" >&2
+    run_qingarchives_display_download "$url"
+    code=$?
+    if (( code == 130 )); then
+      exit 130
+    fi
+    if (( code == 0 )); then
+      echo "[bookget wrapper] done: $url" >&2
+    else
+      (( fail_count++ ))
+      echo "[bookget wrapper] skip after qingarchives special-case: $url (exit=$code)" >&2
+    fi
+    continue
+  fi
+
+  if is_ncl_rbook_searchdetail_url "$url"; then
+    if should_prelogin; then
+      run_rbook_scrape "$url"
+      code=$?
+      if (( code == 130 )); then
+        exit 130
+      fi
+      if (( code == 0 )); then
+        echo "[bookget wrapper] done: $url" >&2
+      else
+        (( fail_count++ ))
+        echo "[bookget wrapper] skip after rbook scrape: $url (exit=$code)" >&2
+      fi
+      continue
+    fi
+    (( fail_count++ ))
+    echo "[bookget wrapper] rbook SearchDetail requires login/verification popup; skipping because -login=0: $url" >&2
+    continue
+  fi
+
+  url_effective="$(resolve_special_entry_url "$url")"
+  if [[ "$url_effective" != "$url" ]]; then
+    echo "[bookget wrapper] resolved site entry URL: $url_effective" >&2
+  fi
+  echo "[bookget wrapper] start: $url" >&2
+
+  if (( auto_mode_explicit == 0 )); then
+    run_single_url_with_auto_modes "$url_effective"
+    code=$?
+    if (( code == 130 )); then
+      exit 130
+    fi
+    if (( code == 0 )); then
+      echo "[bookget wrapper] done: $url" >&2
+    else
+      (( fail_count++ ))
+      echo "[bookget wrapper] skip after auto fallback: $url" >&2
+    fi
+    continue
+  fi
+
+  # Retry once on transient crashes to improve stability.
+  attempt=1
+  success=0
+    while (( attempt <= 2 )); do
+      run_single_url_with_login_retry "$url_effective" "" "$dzi_choice"
+      code=$?
+      if (( code == 130 )); then
+        exit 130
+      fi
+      if (( code == 0 )); then
+        success=1
+        break
+    fi
+
+    echo "[bookget wrapper] attempt $attempt failed for: $url (exit=$code)" >&2
+    if (( attempt == 1 )); then
+      sleep 1
+    fi
+    (( attempt++ ))
+  done
+
+  if (( success == 1 )); then
+    echo "[bookget wrapper] done: $url" >&2
+  else
+    (( fail_count++ ))
+    echo "[bookget wrapper] skip after retries: $url" >&2
+  fi
+
+done
+
+if (( fail_count > 0 )); then
+  echo "[bookget wrapper] completed with $fail_count failed URL(s)" >&2
+  exit 1
+fi
+
+exit 0
