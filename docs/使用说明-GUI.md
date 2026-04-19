@@ -21,7 +21,12 @@
 ## 支持网站信息
 - 顶部按钮：`支持网站信息`。
 - 点击后打开可搜索弹窗，显示可点击链接的网站清单。
-- 清单来源：[bookget 倉庫 `router/interface.go`](https://github.com/deweizhu/bookget/blob/main/router/interface.go)。
+- 清单来源：[bookget 仓库 `router/interface.go`](https://github.com/deweizhu/bookget/blob/main/router/interface.go)。
+- 另有 GUI/wrapper 专用线路，会在清单中单独标注说明，例如：
+- `gj.library.sh.cn`（上海图书馆古籍）：详情页登录后自动进入阅览，`pdfview` 走内置 PDF 下载器。
+- `rbook.ncl.edu.tw`：`SearchDetail` 入口走弹窗浏览器抓页下载。
+- `digitalarchive.npm.gov.tw`：详情页自动转 IIIF manifest。
+- `qingarchives.npm.edu.tw`：详情页自动解析并下载。
 - 另有通用模式：`bookget`、`iiif.io`、`dzicnlib`。
 
 ## 历史记录
@@ -65,10 +70,10 @@
 - `BookGet GUI.app` 内已包含 `bookget / dezoomify-rs / config.ini`。
 - 只保留 `.app` 也可独立运行。
 
-## 登录/验证码（自动弹窗实验版）
+## 登录/验证码（弹窗浏览器）
 - 若下载站点需要登录或验证码，常见表现是下载结果变成 HTML 提示页（而不是图片/PDF）。
-- 本目录内的 `BookGet GUI v1.5 自动登录实验.app` 增加了“失败后自动弹出临时浏览器窗口”的流程：
-- 当检测到上述情况，会弹出一个临时登录窗口（内置浏览器），你在里面完成登录/验证码后点击“完成”，窗口会关闭并自动重试下载。
+- 当前版提供“开启弹窗浏览器（适用于需要登录或验证的网站）”选项。
+- 勾选后，程序会在需要时或特定站点入口上主动弹出一个临时登录窗口（内置浏览器），你在里面完成登录/验证码后点击“完成”，窗口会关闭并自动重试或继续下载。
 - 登录状态会自动用于本次任务；任务结束后会自动清理临时数据。
 - 有些站点在验证通过后会跳转到新的页面（网址会变化）。实验版会自动使用登录窗口里最终停留的“新网址”继续下载，无需手动复制粘贴。
-- 另外，在「基础设置」中可勾选 `需登录或验证`：勾选后会在开始下载前先弹出登录窗口（不再等待失败后再弹）。
+- 上海图书馆建议手动点进“查看全文/进入阅览”后再点“完成”，这样程序拿到的会是真正的阅读器入口。

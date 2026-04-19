@@ -4,9 +4,20 @@
 ![macOS 14+](https://img.shields.io/badge/macOS-14.0%2B-informational)
 ![arch: arm64](https://img.shields.io/badge/arch-arm64-lightgrey)
 
-BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。內置任務隊列、多網址批量、實時日誌、登錄/驗證碼彈窗，並在原版 [bookget](https://github.com/deweizhu/bookget) 基礎上**擴展了更多圖書館的支持**。
+BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。內置任務隊列、多網址批量、實時日誌、彈窗瀏覽器（用於登錄/驗證碼），並在原版 [bookget](https://github.com/deweizhu/bookget) 基礎上**擴展了更多圖書館的支持**。
 
-> 本項目只提供 GUI 前端、登錄助手、命令行包裝器與構建腳本。核心下載引擎 `bookget-core` 與 IIIF 拼圖工具 `dezoomify-rs` 是獨立的開源項目，構建時需要從其官方 Release 下載二進制放入 `Resources/bin/`。
+> 本項目只提供 GUI 前端、彈窗瀏覽器 helper、命令行包裝器與構建腳本。核心下載引擎 `bookget-core` 與 IIIF 拼圖工具 `dezoomify-rs` 是獨立的開源項目，構建時需要從其官方 Release 下載二進制放入 `Resources/bin/`。
+
+---
+
+## 當前支持概況
+
+- **`bookget-core` 原生支持的網站**：沿用上游路由規則。完整清單見 [bookget 倉庫 `router/interface.go`](https://github.com/deweizhu/bookget/blob/main/router/interface.go)。
+- **GUI/wrapper 額外適配的網站**：
+  - **`gj.library.sh.cn`（上海圖書館古籍）**：詳情頁登錄後自動進入閱覽，`dhapi.library.sh.cn/pdfview...` 走內置專用 PDF 下載器。
+  - **`rbook.ncl.edu.tw`（國圖·臺北）**：`SearchDetail` 入口改走彈窗瀏覽器抓頁下載。
+  - **`digitalarchive.npm.gov.tw`（故宮·臺北）**：詳情頁自動轉 IIIF manifest。
+  - **`qingarchives.npm.edu.tw`**：詳情頁自動解析並下載。
 
 ---
 
@@ -16,13 +27,24 @@ BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。
 - **多網址批量**：一次粘貼多行網址，按順序執行；中途異常自動重試 1 次再跳過。
 - **任務隊列與統計**：等待 / 下載中 / 重試中 / 已暫停 / 已終止 / 成功 / 失敗，累積可回看。
 - **實時日誌 + 導出**：UI 只保留最近片段，完整日誌落盤到臨時目錄，可一鍵導出到保存目錄。
-- **登錄/驗證碼彈窗**：內置 WebKit 臨時瀏覽器，完成登錄後自動把登錄態交給下載引擎，並能跟隨驗證後跳轉的新網址繼續下載。
-- **國圖（臺北）rbook 專用模式**：對 `rbook.ncl.edu.tw` 的 `SearchDetail` 類入口自動改用 WebView 抓圖下載。
-- **NPM 臺北 IIIF 模式**：`digitalarchive.npm.gov.tw` Collection/Detail 自動轉 IIIF manifest；同時支持 `qingarchives.npm.edu.tw`。
+- **彈窗瀏覽器**：內置 `WKWebView`，不依賴外部瀏覽器；會在需要時接管新開的閱讀窗口，並把最終 reader URL 交回下載流程。對上海圖書館、台北國圖等專用線路通常應保持開啟。
 - **歷史記錄與一鍵還原**：最近網址 / 最近目錄 下拉記憶，`恢復初始設置` 一鍵清空回到出廠。
 - **支持網站清單**：頂部 `支持網站信息` 按鈕打開可搜索彈窗。
 
-詳細用法見 [docs/BookGetGUIHelp.md](docs/BookGetGUIHelp.md) 與 [docs/使用说明-GUI增强版.md](docs/使用说明-GUI增强版.md)。
+詳細用法見 [docs/BookGetGUIHelp.md](docs/BookGetGUIHelp.md) 與 [docs/使用说明-GUI.md](docs/使用说明-GUI.md)。
+
+---
+
+## 新站點接入接口（統一流程）
+
+新增站點按同一條鏈路接入，不需要在多處重複寫分支：
+
+1. 在 wrapper（`src/bookget-wrapper/bookget`）的 `special_site_adapter_for_url()` 註冊站點識別規則。
+2. 在 `special_site_requires_popup_for_adapter()` 聲明是否強制彈窗瀏覽器。
+3. 若入口鏈接需要改寫，在 `resolve_special_entry_url()` 添加該 adapter 的入口解析。
+4. 若 `bookget-core` 不支持，在 `run_special_site_adapter_if_needed()` 添加專用下載器分發。
+5. 若涉及彈窗瀏覽器中的站點識別，追加 `src/bookget-web-login/main.swift` 裏 `InteractiveSiteAdapterKind.rules` 規則。
+6. 在 GUI 的 `supportedSites` 清單（`src/BookGetGUILauncher/bookget_gui_app.swift`）和幫助文檔同步補說明。
 
 ---
 
@@ -34,12 +56,26 @@ BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。
 
 ---
 
-## 構建
+## 下載與使用（普通用戶）
+
+到 [Releases](https://github.com/TsaichengLiu/bookget-gui/releases) 頁面下載最新 `.zip`，然後：
+
+```zsh
+unzip BookGet-GUI-*.zip
+xattr -cr "BookGet GUI.app"   # 必須！否則 Gatekeeper 會攔截
+open "BookGet GUI.app"
+```
+
+> **`xattr -cr` 是必需的**。因為本項目使用 ad-hoc 簽名（非 Apple Developer ID），不執行這一步會看到「無法驗證」或「已損壞」的錯誤。
+
+---
+
+## 從源碼構建
 
 1. **克隆倉庫**
 
    ```zsh
-   git clone https://github.com/<your-account>/bookget-gui.git
+   git clone https://github.com/TsaichengLiu/bookget-gui.git
    cd bookget-gui
    ```
 
@@ -50,7 +86,7 @@ BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。
    | `bookget-core` | [deweizhu/bookget](https://github.com/deweizhu/bookget) Release（arm64 macOS） | 下載引擎 |
    | `dezoomify-rs` | [lovasoa/dezoomify-rs](https://github.com/lovasoa/dezoomify-rs) Release（arm64 macOS） | IIIF 分塊拼圖 |
 
-   下載後記得 `chmod +x`，並根據需要用 `xattr -dr com.apple.quarantine <binary>` 去除下載隔離屬性。
+   下載後記得 `chmod +x`，並用 `xattr -dr com.apple.quarantine <binary>` 去除下載隔離屬性。
 
 3. **複製 wrapper 腳本**
 
@@ -65,7 +101,7 @@ BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。
    cp -R app-template "BookGet GUI（v1.6-25.0417）.app"
    ```
 
-5. **編譯 GUI 與登錄助手**
+5. **編譯 GUI 與彈窗瀏覽器 helper**
 
    ```zsh
    ./scripts/rebuild_app.sh
@@ -90,12 +126,12 @@ bookget-gui/
 │   ├── BookGetGUILauncher/
 │   │   └── bookget_gui_app.swift           # 主程序（SwiftUI，單文件）
 │   ├── bookget-web-login/
-│   │   └── main.swift                      # 登錄/驗證碼 WebKit 助手
+│   │   └── main.swift                      # 彈窗瀏覽器 + 專用下載器
 │   └── bookget-wrapper/
-│       └── bookget                         # zsh 包裝器，供 GUI 調用 bookget-core
+│       └── bookget                         # zsh 包裝器，負責站點識別、入口改寫、專用分發
 ├── docs/
 │   ├── BookGetGUIHelp.md                   # 內置幫助（會被拷貝進 .app/Resources）
-│   └── 使用说明-GUI增强版.md
+│   └── 使用说明-GUI.md
 ├── scripts/
 │   └── rebuild_app.sh                      # swiftc + codesign 一鍵構建
 └── app-template/                           # .app 骨架（Info.plist/icns/config.ini）
@@ -124,7 +160,7 @@ bookget-gui/
 
 ## 隱私聲明
 
-- 登錄/驗證碼窗口使用臨時（非持久化）瀏覽器會話，任務結束後清理。
+- 彈窗瀏覽器使用臨時（非持久化）瀏覽器會話，任務結束後清理。
 - 登錄態僅本機使用，絕不上傳任何服務器。
 - 倉庫已在 `.gitignore` 中屏蔽 `cookie.txt` / `localStorage.txt` / `urls.txt` 等可能含個人數據的文件——請在提交前再次確認。
 
@@ -132,4 +168,4 @@ bookget-gui/
 
 ## 反饋
 
-遇到問題請優先從 GUI 的「導出任務日誌」按鈕導出日誌，連同失敗網址與是否勾選了「登錄彈窗」一併貼到 Issue。
+遇到問題請優先從 GUI 的「導出任務日誌」按鈕導出日誌，連同失敗網址與是否勾選了「彈窗瀏覽器」一併貼到 Issue。

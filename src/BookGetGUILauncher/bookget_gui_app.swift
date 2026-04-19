@@ -881,6 +881,7 @@ final class DownloadViewModel: ObservableObject {
         .init(name: "dpul.princeton.edu", url: "https://dpul.princeton.edu", note: "源码路由：dpul.princeton.edu"),
         .init(name: "dsr.nii.ac.jp", url: "https://dsr.nii.ac.jp", note: "源码路由：dsr.nii.ac.jp"),
         .init(name: "emuseum.nich.go.jp", url: "https://emuseum.nich.go.jp", note: "源码路由：emuseum.nich.go.jp"),
+        .init(name: "gj.library.sh.cn (上海图书馆古籍)", url: "https://gj.library.sh.cn", note: "GUI/wrapper 专用支持：详情页登录后自动进入阅览；pdfview 走内置专用 PDF 下载"),
         .init(name: "gj.tianyige.com.cn", url: "https://gj.tianyige.com.cn", note: "源码路由：gj.tianyige.com.cn"),
         .init(name: "gjsztsg.sdutcm.edu.cn", url: "https://gjsztsg.sdutcm.edu.cn", note: "源码路由：gjsztsg.sdutcm.edu.cn"),
         .init(name: "guji.nlc.cn", url: "https://guji.nlc.cn", note: "源码路由：guji.nlc.cn"),
@@ -913,12 +914,13 @@ final class DownloadViewModel: ObservableObject {
         .init(name: "ostasien.digitale-sammlungen.de", url: "https://ostasien.digitale-sammlungen.de", note: "源码路由：ostasien.digitale-sammlungen.de"),
         .init(name: "ouroots.nlc.cn", url: "https://ouroots.nlc.cn", note: "源码路由：ouroots.nlc.cn"),
         .init(name: "oyjy.wzlib.cn", url: "https://oyjy.wzlib.cn", note: "源码路由：oyjy.wzlib.cn"),
-        .init(name: "qingarchives.npm.edu.tw", url: "https://qingarchives.npm.edu.tw", note: "GUI/wrapper 专用支持：qingarchives.npm.edu.tw"),
+        .init(name: "qingarchives.npm.edu.tw", url: "https://qingarchives.npm.edu.tw", note: "GUI/wrapper 专用支持：清代档案详情页自动解析并下载"),
         .init(name: "read.nlc.cn", url: "https://read.nlc.cn", note: "源码路由：read.nlc.cn"),
         .init(name: "repo.komazawa-u.ac.jp", url: "https://repo.komazawa-u.ac.jp", note: "源码路由：repo.komazawa-u.ac.jp"),
         .init(name: "repository.lib.cuhk.edu.hk", url: "https://repository.lib.cuhk.edu.hk", note: "源码路由：repository.lib.cuhk.edu.hk"),
         .init(name: "shanben.ioc.u-tokyo.ac.jp", url: "https://shanben.ioc.u-tokyo.ac.jp", note: "源码路由：shanben.ioc.u-tokyo.ac.jp"),
-        .init(name: "taiwanebook.ncl.edu.tw", url: "https://taiwanebook.ncl.edu.tw", note: "源码路由：taiwanebook.ncl.edu.tw"),
+        .init(name: "rbook.ncl.edu.tw", url: "https://rbook.ncl.edu.tw", note: "GUI/wrapper 专用支持：SearchDetail 入口走弹窗浏览器抓页下载"),
+        .init(name: "taiwanebook.ncl.edu.tw", url: "https://taiwanebook.ncl.edu.tw", note: "GUI/wrapper 协同支持：登录/验证弹窗浏览器"),
         .init(name: "viewer.rsl.ru", url: "https://viewer.rsl.ru", note: "源码路由：viewer.rsl.ru"),
         .init(name: "webarchives.tnm.jp", url: "https://webarchives.tnm.jp", note: "源码路由：webarchives.tnm.jp"),
         .init(name: "www.bl.uk", url: "https://www.bl.uk", note: "源码路由：www.bl.uk"),
@@ -2555,7 +2557,7 @@ struct ContentView: View {
                                     Text("验证")
                                         .frame(width: 52, alignment: .leading)
                                         .foregroundStyle(cardSecondaryText)
-		                                    Toggle("在需要登录或验证时弹窗", isOn: Binding(
+		                                    Toggle("开启弹窗浏览器（适用于需要登录或验证的网站）", isOn: Binding(
 		                                        get: { vm.needLogin },
 		                                        set: { vm.applyNeedLogin($0) }
 		                                    ))

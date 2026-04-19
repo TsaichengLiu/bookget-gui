@@ -19,6 +19,39 @@ struct Args {
     var intervalSeconds: Double = 5.0
 }
 
+private enum InteractiveSiteAdapterKind: String {
+    case generic
+    case shanghaiLibrary
+    case nclRBook
+
+    private struct Rule {
+        let kind: InteractiveSiteAdapterKind
+        let patterns: [String]
+    }
+
+    // Keep adapter detection declarative so new interactive sites can be
+    // added by appending one rule instead of editing branching logic.
+    private static let rules: [Rule] = [
+        Rule(kind: .shanghaiLibrary, patterns: [
+            "gj.library.sh.cn",
+            "dhapi.library.sh.cn",
+            "/stgj2021/"
+        ]),
+        Rule(kind: .nclRBook, patterns: [
+            "rbook.ncl.edu.tw",
+            "taiwanebook.ncl.edu.tw"
+        ])
+    ]
+
+    static func detect(url: URL) -> InteractiveSiteAdapterKind {
+        let text = url.absoluteString.lowercased()
+        for rule in rules where rule.patterns.contains(where: { text.contains($0) }) {
+            return rule.kind
+        }
+        return .generic
+    }
+}
+
 private func usage(_ msg: String? = nil) -> Never {
     if let msg {
         FileHandle.standardError.write(Data((msg + "\n").utf8))
@@ -351,42 +384,114 @@ private func downloadShanghaiLibraryPDFView(args: Args) throws {
             ? "shl_\(safeBase).pdf"
             : "shl_\(safeBase)_\(safeItemName)_\(itemIndex + 1).pdf"
         let outURL = outDir.appendingPathComponent(fileName)
-        let merged = PDFDocument()
+        let partialURL = outDir.appendingPathComponent(fileName.replacingOccurrences(of: ".pdf", with: ".partial.pdf"))
+        let pagesDir = outDir.appendingPathComponent(fileName.replacingOccurrences(of: ".pdf", with: ".pages"), isDirectory: true)
+
+        try FileManager.default.createDirectory(at: pagesDir, withIntermediateDirectories: true)
+
+        func pageCacheURL(_ pageNo: Int) -> URL {
+            pagesDir.appendingPathComponent(String(format: "%04d.pdf", pageNo))
+        }
+
+        func fileExistsAndNonEmpty(_ url: URL) -> Bool {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let size = attrs[.size] as? NSNumber else {
+                return false
+            }
+            return size.intValue > 0
+        }
+
+        func mergeCachedPages(into destinationURL: URL) throws -> Int {
+            var merged = PDFDocument()
+            var appendedPages = 0
+
+            func compactMergedDocumentIfNeeded(force: Bool = false) throws {
+                guard merged.pageCount > 0 else { return }
+                if !force && appendedPages % 25 != 0 && appendedPages != item.pageCount {
+                    return
+                }
+                guard merged.write(to: destinationURL) else {
+                    throw ShanghaiDownloadError.writeFailed(destinationURL.path)
+                }
+                if let reopened = PDFDocument(url: destinationURL) {
+                    merged = reopened
+                }
+            }
+
+            for pageNo in 1...item.pageCount {
+                let cachedURL = pageCacheURL(pageNo)
+                guard fileExistsAndNonEmpty(cachedURL) else { break }
+
+                let addedFromCurrentFile: Int = try autoreleasepool {
+                    guard let pageDocument = PDFDocument(url: cachedURL), pageDocument.pageCount > 0 else {
+                        throw ShanghaiDownloadError.invalidPagePDF(pageNo)
+                    }
+                    let count = pageDocument.pageCount
+                    for idx in 0..<count {
+                        if let page = pageDocument.page(at: idx) {
+                            merged.insert(page, at: merged.pageCount)
+                        }
+                    }
+                    return count
+                }
+
+                appendedPages += addedFromCurrentFile
+                try compactMergedDocumentIfNeeded()
+            }
+
+            try compactMergedDocumentIfNeeded(force: true)
+            return appendedPages
+        }
 
         FileHandle.standardError.write(Data("[bookget-web-login] shl item \(itemIndex + 1)/\(payload.items.count): \(safeItemName) (\(item.pageCount) pages)\n".utf8))
 
-        for pageNo in 1...item.pageCount {
-            let streamBody = try JSONEncoder().encode(ShanghaiStreamRequest(
-                dbname: context.dbname,
-                innerflag: context.innerflag,
-                itemId: item.value,
-                pageNo: pageNo
-            ))
-            let (pageData, pageResponse) = try makeShanghaiAPIRequest(
-                url: streamURL,
-                token: context.token,
-                userAgent: args.userAgent,
-                jsonBody: streamBody
-            )
-            guard (200..<300).contains(pageResponse.statusCode) else {
-                let message = String(data: pageData, encoding: .utf8) ?? "HTTP \(pageResponse.statusCode)"
-                throw ShanghaiDownloadError.streamRequestFailed(message)
-            }
-            guard let pageDocument = PDFDocument(data: pageData), pageDocument.pageCount > 0 else {
-                throw ShanghaiDownloadError.invalidPagePDF(pageNo)
-            }
-
-            for idx in 0..<pageDocument.pageCount {
-                if let page = pageDocument.page(at: idx) {
-                    merged.insert(page, at: merged.pageCount)
+        do {
+            for pageNo in 1...item.pageCount {
+                let cachedURL = pageCacheURL(pageNo)
+                if fileExistsAndNonEmpty(cachedURL) {
+                    FileHandle.standardError.write(Data("[bookget-web-login] shl reused \(pageNo)/\(item.pageCount)\n".utf8))
+                    continue
                 }
+
+                let streamBody = try JSONEncoder().encode(ShanghaiStreamRequest(
+                    dbname: context.dbname,
+                    innerflag: context.innerflag,
+                    itemId: item.value,
+                    pageNo: pageNo
+                ))
+                let (pageData, pageResponse) = try makeShanghaiAPIRequest(
+                    url: streamURL,
+                    token: context.token,
+                    userAgent: args.userAgent,
+                    jsonBody: streamBody
+                )
+                guard (200..<300).contains(pageResponse.statusCode) else {
+                    let message = String(data: pageData, encoding: .utf8) ?? "HTTP \(pageResponse.statusCode)"
+                    throw ShanghaiDownloadError.streamRequestFailed(message)
+                }
+                let isValidPage = try autoreleasepool { () throws -> Bool in
+                    guard let pageDocument = PDFDocument(data: pageData), pageDocument.pageCount > 0 else {
+                        throw ShanghaiDownloadError.invalidPagePDF(pageNo)
+                    }
+                    return true
+                }
+                guard isValidPage else {
+                    throw ShanghaiDownloadError.invalidPagePDF(pageNo)
+                }
+                try pageData.write(to: cachedURL, options: [.atomic])
+                FileHandle.standardError.write(Data("[bookget-web-login] shl saved \(pageNo)/\(item.pageCount)\n".utf8))
             }
-            FileHandle.standardError.write(Data("[bookget-web-login] shl saved \(pageNo)/\(item.pageCount)\n".utf8))
+        } catch {
+            let partialPages = (try? mergeCachedPages(into: partialURL)) ?? 0
+            if partialPages > 0 {
+                FileHandle.standardError.write(Data("[bookget-web-login] shl partial output: \(partialURL.lastPathComponent) (\(partialPages) pages cached)\n".utf8))
+            }
+            throw error
         }
 
-        guard merged.write(to: outURL) else {
-            throw ShanghaiDownloadError.writeFailed(outURL.path)
-        }
+        _ = try mergeCachedPages(into: outURL)
+        try? FileManager.default.removeItem(at: partialURL)
+        try? FileManager.default.removeItem(at: pagesDir)
         FileHandle.standardError.write(Data("[bookget-web-login] shl output: \(outURL.lastPathComponent)\n".utf8))
     }
 }
@@ -572,11 +677,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     private let urlOutURL: URL?
     private let userAgent: String
     private let mode: Args.Mode
+    private let siteAdapter: InteractiveSiteAdapterKind
     private let outDir: URL?
     private let intervalSeconds: Double
 
     private var window: NSWindow!
+    private var rootView: NSView!
     private var webView: WKWebView!
+    private var popupBridgeWebView: WKWebView?
     private var urlField: NSTextField!
     private var isCompleting = false
     private var isScraping = false
@@ -640,6 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         self.urlOutURL = args.urlOut
         self.userAgent = args.userAgent
         self.mode = args.mode
+        self.siteAdapter = InteractiveSiteAdapterKind.detect(url: args.url)
         self.outDir = args.outDir
         self.intervalSeconds = args.intervalSeconds
         super.init()
@@ -662,6 +771,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         lastMeaningfulShanghaiLibraryReaderURL = abs
     }
 
+    private func makeBrowserConfiguration(from provided: WKWebViewConfiguration? = nil) -> WKWebViewConfiguration {
+        let config = provided ?? WKWebViewConfiguration()
+        if provided == nil {
+            config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
+        }
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        if #available(macOS 11.0, *) {
+            config.defaultWebpagePreferences.allowsContentJavaScript = true
+        }
+        let hasCaptureScript = config.userContentController.userScripts.contains {
+            $0.source == Self.captureMeaningfulURLScript
+        }
+        if !hasCaptureScript {
+            let captureScript = WKUserScript(
+                source: Self.captureMeaningfulURLScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+            config.userContentController.addUserScript(captureScript)
+        }
+        return config
+    }
+
+    private func isBlankPopupURL(_ url: URL?) -> Bool {
+        guard let url else { return true }
+        let value = url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value.isEmpty { return true }
+        return value == "about:blank" || value == "about:srcdoc" || value.hasPrefix("javascript:")
+    }
+
+    private func loadRequestInMainWebView(_ request: URLRequest) {
+        rememberMeaningfulShanghaiLibraryReaderURL(request.url)
+        if let abs = request.url?.absoluteString, !abs.isEmpty {
+            urlField.stringValue = abs
+        }
+        webView.load(request)
+    }
+
+    private func popupBridgeView(with configuration: WKWebViewConfiguration) -> WKWebView {
+        if let existing = popupBridgeWebView {
+            return existing
+        }
+
+        let popup = WKWebView(frame: NSRect(x: 0, y: 0, width: 1, height: 1), configuration: configuration)
+        popup.translatesAutoresizingMaskIntoConstraints = false
+        popup.customUserAgent = userAgent
+        popup.uiDelegate = self
+        popup.navigationDelegate = self
+        popup.isHidden = true
+        popup.alphaValue = 0
+        popupBridgeWebView = popup
+        rootView.addSubview(popup)
+        NSLayoutConstraint.activate([
+            popup.widthAnchor.constraint(equalToConstant: 1),
+            popup.heightAnchor.constraint(equalToConstant: 1),
+            popup.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            popup.topAnchor.constraint(equalTo: rootView.topAnchor),
+        ])
+        return popup
+    }
+
+    private func webViewRole(_ webView: WKWebView) -> String {
+        if webView === self.webView {
+            return "main"
+        }
+        if let popupBridgeWebView, webView === popupBridgeWebView {
+            return "popup"
+        }
+        return "unknown"
+    }
+
+    private func logNavigationError(_ error: Error, role: String, stage: String, failingURL: URL?) {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+            return
+        }
+        let urlText = failingURL?.absoluteString ?? targetURL.absoluteString
+        FileHandle.standardError.write(Data("[bookget-web-login] \(role) webview \(stage) failed: \(urlText) (\(nsError.localizedDescription))\n".utf8))
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if targetHost.isEmpty {
             FileHandle.standardError.write(Data(("Invalid URL host: \(targetURL.absoluteString)\n").utf8))
@@ -679,19 +868,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             backing: .buffered,
             defer: false
         )
-        window.title = (mode == .rbookScrape ? "國圖下載 (BookGet) - \(targetHost)" : "登录验证 (BookGet) - \(targetHost)")
+        window.title = (mode == .rbookScrape ? "國圖下載 (BookGet) - \(targetHost)" : "弹窗浏览器 (BookGet) - \(targetHost)")
         window.center()
         window.delegate = self
 
-        let root = NSView()
-        root.translatesAutoresizingMaskIntoConstraints = false
-        window.contentView = root
+        rootView = NSView()
+        rootView.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView = rootView
 
         let instructionText: String = {
             if mode == .rbookScrape {
                 return "请在此窗口完成验证码/登录。点击“开始下载”后窗口会隐藏并开始保存图片到目标文件夹。"
             }
-            return "请在此窗口完成登录/验证码。若页面有“阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”，窗口会关闭并继续下载。"
+            if siteAdapter == .shanghaiLibrary {
+                return "请在此弹窗浏览器中完成登录/验证码。若页面有“查看全文/阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”。"
+            }
+            return "请在此弹窗浏览器中完成登录/验证码。若页面有“阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”，窗口会关闭并继续下载。"
         }()
         let instruction = NSTextField(labelWithString: instructionText)
         instruction.translatesAutoresizingMaskIntoConstraints = false
@@ -726,16 +918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         urlBar.spacing = 8
         urlBar.alignment = .centerY
 
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
-        let userContentController = WKUserContentController()
-        let captureScript = WKUserScript(
-            source: Self.captureMeaningfulURLScript,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
-        )
-        userContentController.addUserScript(captureScript)
-        config.userContentController = userContentController
+        let config = makeBrowserConfiguration()
         webView = WKWebView(frame: .zero, configuration: config)
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.customUserAgent = userAgent
@@ -757,28 +940,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         buttonRow.spacing = 12
         buttonRow.alignment = .centerY
 
-        root.addSubview(instruction)
-        root.addSubview(urlBar)
-        root.addSubview(webView)
-        root.addSubview(buttonRow)
+        rootView.addSubview(instruction)
+        rootView.addSubview(urlBar)
+        rootView.addSubview(webView)
+        rootView.addSubview(buttonRow)
 
         NSLayoutConstraint.activate([
-            instruction.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            instruction.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            instruction.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            instruction.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 12),
+            instruction.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 12),
+            instruction.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -12),
 
             urlBar.topAnchor.constraint(equalTo: instruction.bottomAnchor, constant: 10),
-            urlBar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            urlBar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            urlBar.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 12),
+            urlBar.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -12),
 
-            buttonRow.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
-            buttonRow.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            buttonRow.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -12),
+            buttonRow.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -12),
 
             urlField.widthAnchor.constraint(greaterThanOrEqualToConstant: 420),
 
             webView.topAnchor.constraint(equalTo: urlBar.bottomAnchor, constant: 10),
-            webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            webView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: buttonRow.topAnchor, constant: -10),
         ])
 
@@ -812,28 +995,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
+        let prepared = makeBrowserConfiguration(from: configuration)
         if let url = navigationAction.request.url {
             rememberMeaningfulShanghaiLibraryReaderURL(url)
-            webView.load(URLRequest(url: url))
+            if !isBlankPopupURL(url) {
+                let popup = popupBridgeView(with: prepared)
+                return popup
+            }
         }
-        return nil
+        return popupBridgeView(with: prepared)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
-            rememberMeaningfulShanghaiLibraryReaderURL(url)
-            webView.load(URLRequest(url: url))
-            decisionHandler(.cancel)
+        if let popupBridgeWebView, webView === popupBridgeWebView {
+            if let url = navigationAction.request.url, !isBlankPopupURL(url) {
+                loadRequestInMainWebView(navigationAction.request)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+            return
+        }
+
+        if navigationAction.targetFrame == nil {
+            if let url = navigationAction.request.url, !isBlankPopupURL(url) {
+                loadRequestInMainWebView(navigationAction.request)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
             return
         }
         decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        let role = webViewRole(webView)
         rememberMeaningfulShanghaiLibraryReaderURL(webView.url)
-        if let u = webView.url?.absoluteString {
+        if role == "main", let u = webView.url?.absoluteString {
             urlField.stringValue = u
         }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        logNavigationError(error, role: webViewRole(webView), stage: "navigation", failingURL: webView.url)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        let failingURL = (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL ?? webView.url
+        logNavigationError(error, role: webViewRole(webView), stage: "provisional navigation", failingURL: failingURL)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        FileHandle.standardError.write(Data("[bookget-web-login] \(webViewRole(webView)) webview content process terminated, reloading...\n".utf8))
+        webView.reload()
     }
 
     func windowWillClose(_ notification: Notification) {

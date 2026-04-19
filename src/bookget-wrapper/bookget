@@ -132,6 +132,7 @@ typeset -A AUTO_LOGIN_TRIED_BY_HOST
 typeset -a AUTO_COOKIE_TEMP_FILES
 DEFAULTS_DOMAIN="com.bookget.gui.launcher.autologin"
 DEFAULTS_KEY_NEED_LOGIN="bookget.last.needLogin"
+SPECIAL_RUN_NOT_HANDLED=111
 
 cleanup_auto_cookie_files() {
   local f
@@ -191,13 +192,46 @@ is_shanghai_library_pdfview_url() {
   [[ "$lc" == *"dhapi.library.sh.cn/pdfview/"* && "$url" == *\?* ]]
 }
 
-should_force_prelogin_for_url() {
+special_site_adapter_for_url() {
   local url="$1"
 
   if is_shanghai_library_detail_url "$url"; then
+    print -r -- "shanghai-library-detail"
     return 0
   fi
+  if is_shanghai_library_pdfview_url "$url"; then
+    print -r -- "shanghai-library-pdfview"
+    return 0
+  fi
+  if is_qingarchives_display_url "$url"; then
+    print -r -- "npm-qingarchives-display"
+    return 0
+  fi
+  if is_ncl_rbook_searchdetail_url "$url"; then
+    print -r -- "ncl-rbook-searchdetail"
+    return 0
+  fi
+  if is_npm_digitalarchive_detail_url "$url"; then
+    print -r -- "npm-digitalarchive-detail"
+    return 0
+  fi
+  print -r -- ""
+}
+
+special_site_requires_popup_for_adapter() {
+  local adapter="$1"
+  case "$adapter" in
+    shanghai-library-detail|ncl-rbook-searchdetail)
+      return 0
+      ;;
+  esac
   return 1
+}
+
+should_force_popup_browser_for_url() {
+  local adapter
+  adapter="$(special_site_adapter_for_url "$1")"
+  special_site_requires_popup_for_adapter "$adapter"
 }
 
 run_shanghai_library_pdf_download() {
@@ -217,6 +251,45 @@ run_shanghai_library_pdf_download() {
 
   echo "[bookget wrapper] using Shanghai Library PDF fallback downloader..." >&2
   "$helper" --shl-download --url "$url" --out-dir "$target_output_dir"
+}
+
+run_special_site_adapter_if_needed() {
+  local url="$1"
+  local adapter="${2:-}"
+  local strict_login_required="${3:-1}"
+
+  if [[ -z "$adapter" ]]; then
+    adapter="$(special_site_adapter_for_url "$url")"
+  fi
+
+  case "$adapter" in
+    shanghai-library-pdfview)
+      run_shanghai_library_pdf_download "$url"
+      return $?
+      ;;
+    npm-qingarchives-display)
+      run_qingarchives_display_download "$url"
+      return $?
+      ;;
+    ncl-rbook-searchdetail)
+      if should_prelogin; then
+        run_rbook_scrape "$url"
+        return $?
+      fi
+      if (( strict_login_required == 1 )); then
+        echo "[bookget wrapper] rbook SearchDetail requires login/verification popup; skipping because -login=0: $url" >&2
+        return 95
+      fi
+      echo "[bookget wrapper] rbook special-case requires login/verification; skipping WebView scrape because -login=0" >&2
+      return $SPECIAL_RUN_NOT_HANDLED
+      ;;
+    "")
+      return $SPECIAL_RUN_NOT_HANDLED
+      ;;
+    *)
+      return $SPECIAL_RUN_NOT_HANDLED
+      ;;
+  esac
 }
 
 url_host_key() {
@@ -462,7 +535,7 @@ prelogin_for_url_if_needed() {
 
   REPLY=""
   if ! should_prelogin; then
-    should_force_prelogin_for_url "$url" || return 0
+    should_force_popup_browser_for_url "$url" || return 0
   fi
 
   host="$(url_host_key "$url")"
@@ -492,6 +565,7 @@ run_single_url_with_login_retry() {
   local login_url=""
   local login_rc=0
   local resolved_url=""
+  local special_code=0
 
   prelogin_for_url_if_needed "$url_work"
   prelogin_rc=$?
@@ -512,10 +586,10 @@ run_single_url_with_login_retry() {
     echo "[bookget wrapper] resolved site entry URL after prelogin: $resolved_url" >&2
     url_work="$resolved_url"
   fi
-
-  if is_shanghai_library_pdfview_url "$url_work"; then
-    run_shanghai_library_pdf_download "$url_work"
-    return $?
+  run_special_site_adapter_if_needed "$url_work"
+  special_code=$?
+  if (( special_code != SPECIAL_RUN_NOT_HANDLED )); then
+    return $special_code
   fi
 
   run_single_url "$url_work" "$mode_override" "$dzi_override"
@@ -547,9 +621,10 @@ run_single_url_with_login_retry() {
     echo "[bookget wrapper] resolved site entry URL after login: $resolved_url" >&2
     retry_url="$resolved_url"
   fi
-  if is_shanghai_library_pdfview_url "$retry_url"; then
-    run_shanghai_library_pdf_download "$retry_url"
-    return $?
+  run_special_site_adapter_if_needed "$retry_url"
+  special_code=$?
+  if (( special_code != SPECIAL_RUN_NOT_HANDLED )); then
+    return $special_code
   fi
   run_single_url "$retry_url" "$mode_override" "$dzi_override"
   return $?
@@ -1077,13 +1152,12 @@ run_single_url_with_auto_modes() {
   local url_for_mode
   local resolved_url
   local code
+  local special_code=0
 
-  if is_ncl_rbook_searchdetail_url "$original_url"; then
-    if should_prelogin; then
-      run_rbook_scrape "$original_url"
-      return $?
-    fi
-    echo "[bookget wrapper] rbook special-case requires login/verification; skipping WebView scrape because -login=0" >&2
+  run_special_site_adapter_if_needed "$original_url" "" "0"
+  special_code=$?
+  if (( special_code != SPECIAL_RUN_NOT_HANDLED )); then
+    return $special_code
   fi
 
   for mode in 0 1 2; do
@@ -1976,18 +2050,25 @@ resolve_npm_digitalarchive_manifest_url() {
 
 resolve_special_entry_url() {
   local url="$1"
-  local resolved
+  local adapter
+  local resolved="$url"
 
-  resolved="$(resolve_ncl_rbook_url "$url")"
+  adapter="$(special_site_adapter_for_url "$url")"
+  case "$adapter" in
+    ncl-rbook-searchdetail)
+      resolved="$(resolve_ncl_rbook_url "$url")"
+      ;;
+    npm-digitalarchive-detail)
+      resolved="$(resolve_npm_digitalarchive_manifest_url "$url")"
+      ;;
+    *)
+      resolved="$url"
+      ;;
+  esac
+
   if [[ -z "$resolved" ]]; then
     resolved="$url"
   fi
-
-  resolved="$(resolve_npm_digitalarchive_manifest_url "$resolved")"
-  if [[ -z "$resolved" ]]; then
-    resolved="$url"
-  fi
-
   print -r -- "$resolved"
 }
 
@@ -2049,26 +2130,26 @@ fi
 
 if (( ${#urls[@]} <= 1 )); then
   if (( ${#urls[@]} == 1 )); then
-    # rbook.ncl.edu.tw SearchDetail is not supported by bookget-core; always use the WebView scrape helper
-    # when login/verification popups are enabled, even if advanced params (-a/-speed/...) are set.
-    if is_ncl_rbook_searchdetail_url "${urls[1]}"; then
-      if should_prelogin; then
-        run_rbook_scrape "${urls[1]}"
-        exit $?
-      fi
-      echo "[bookget wrapper] rbook SearchDetail requires login/verification popup; skipping because -login=0" >&2
-      exit 95
-    fi
-
-    if is_qingarchives_display_url "${urls[1]}"; then
-      run_qingarchives_display_download "${urls[1]}"
-      exit $?
+    run_special_site_adapter_if_needed "${urls[1]}"
+    code=$?
+    if (( code != SPECIAL_RUN_NOT_HANDLED )); then
+      exit $code
     fi
 
     url_effective="$(resolve_special_entry_url "${urls[1]}")"
     if [[ "$url_effective" != "${urls[1]}" ]]; then
       echo "[bookget wrapper] resolved site entry URL: $url_effective" >&2
     fi
+
+    run_special_site_adapter_if_needed "$url_effective"
+    code=$?
+    if (( code != SPECIAL_RUN_NOT_HANDLED )); then
+      if (( code == 0 )) && [[ "$url_effective" != "${urls[1]}" ]]; then
+        echo "[bookget wrapper] done via special-site adapter: ${urls[1]}" >&2
+      fi
+      exit $code
+    fi
+
     if (( auto_mode_explicit == 0 )); then
       run_single_url_with_auto_modes "$url_effective"
     else
@@ -2088,10 +2169,9 @@ echo "[bookget wrapper] queued ${#urls[@]} URLs for sequential download" >&2
 
 fail_count=0
 for url in "${urls[@]}"; do
-  if is_qingarchives_display_url "$url"; then
-    echo "[bookget wrapper] start qingarchives special-case: $url" >&2
-    run_qingarchives_display_download "$url"
-    code=$?
+  run_special_site_adapter_if_needed "$url"
+  code=$?
+  if (( code != SPECIAL_RUN_NOT_HANDLED )); then
     if (( code == 130 )); then
       exit 130
     fi
@@ -2099,28 +2179,8 @@ for url in "${urls[@]}"; do
       echo "[bookget wrapper] done: $url" >&2
     else
       (( fail_count++ ))
-      echo "[bookget wrapper] skip after qingarchives special-case: $url (exit=$code)" >&2
+      echo "[bookget wrapper] skip after special-site adapter: $url (exit=$code)" >&2
     fi
-    continue
-  fi
-
-  if is_ncl_rbook_searchdetail_url "$url"; then
-    if should_prelogin; then
-      run_rbook_scrape "$url"
-      code=$?
-      if (( code == 130 )); then
-        exit 130
-      fi
-      if (( code == 0 )); then
-        echo "[bookget wrapper] done: $url" >&2
-      else
-        (( fail_count++ ))
-        echo "[bookget wrapper] skip after rbook scrape: $url (exit=$code)" >&2
-      fi
-      continue
-    fi
-    (( fail_count++ ))
-    echo "[bookget wrapper] rbook SearchDetail requires login/verification popup; skipping because -login=0: $url" >&2
     continue
   fi
 
@@ -2128,6 +2188,22 @@ for url in "${urls[@]}"; do
   if [[ "$url_effective" != "$url" ]]; then
     echo "[bookget wrapper] resolved site entry URL: $url_effective" >&2
   fi
+
+  run_special_site_adapter_if_needed "$url_effective"
+  code=$?
+  if (( code != SPECIAL_RUN_NOT_HANDLED )); then
+    if (( code == 130 )); then
+      exit 130
+    fi
+    if (( code == 0 )); then
+      echo "[bookget wrapper] done: $url" >&2
+    else
+      (( fail_count++ ))
+      echo "[bookget wrapper] skip after special-site adapter: $url (exit=$code)" >&2
+    fi
+    continue
+  fi
+
   echo "[bookget wrapper] start: $url" >&2
 
   if (( auto_mode_explicit == 0 )); then
