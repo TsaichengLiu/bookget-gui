@@ -136,6 +136,28 @@ struct SupportedSite: Identifiable {
     let name: String
     let url: String
     let note: String
+
+    private struct Entry: Decodable {
+        let name: String
+        let url: String
+        let note: String?
+    }
+
+    private struct Registry: Decodable {
+        let sites: [Entry]
+    }
+
+    /// Loaded from Contents/Resources/sites.json, shared with the wrapper and login helper.
+    static func loadBundled() -> [SupportedSite] {
+        guard let url = Bundle.main.url(forResource: "sites", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let registry = try? JSONDecoder().decode(Registry.self, from: data) else {
+            return []
+        }
+        return registry.sites.map {
+            SupportedSite(name: $0.name, url: $0.url, note: $0.note ?? "源码路由：\($0.name)")
+        }
+    }
 }
 
 enum UserAgentPreset: String, CaseIterable, Identifiable {
@@ -963,88 +985,7 @@ final class DownloadViewModel: ObservableObject {
     @Published var recentUrls: [String] = []
     @Published var recentDirectories: [String] = []
 
-    let supportedSites: [SupportedSite] = [
-        .init(name: "111.7.82.29:8090", url: "http://111.7.82.29:8090", note: "源码路由：111.7.82.29:8090"),
-        .init(name: "124.134.220.209:8100", url: "http://124.134.220.209:8100", note: "源码路由：124.134.220.209:8100"),
-        .init(name: "arcgxhpv7cw0.db.wzlib.cn", url: "https://arcgxhpv7cw0.db.wzlib.cn", note: "源码路由：arcgxhpv7cw0.db.wzlib.cn"),
-        .init(name: "archive.org", url: "https://archive.org", note: "源码路由：archive.org"),
-        .init(name: "archive.wul.waseda.ac.jp", url: "https://archive.wul.waseda.ac.jp", note: "源码路由：archive.wul.waseda.ac.jp"),
-        .init(name: "asia.si.edu", url: "https://asia.si.edu", note: "源码路由：asia.si.edu"),
-        .init(name: "babel.hathitrust.org", url: "https://babel.hathitrust.org", note: "源码路由：babel.hathitrust.org"),
-        .init(name: "catalog.princeton.edu", url: "https://catalog.princeton.edu", note: "源码路由：catalog.princeton.edu"),
-        .init(name: "curiosity.lib.harvard.edu", url: "https://curiosity.lib.harvard.edu", note: "源码路由：curiosity.lib.harvard.edu"),
-        .init(name: "da.library.ryukoku.ac.jp", url: "https://da.library.ryukoku.ac.jp", note: "源码路由：da.library.ryukoku.ac.jp"),
-        .init(name: "db2.sido.keio.ac.jp", url: "https://db2.sido.keio.ac.jp", note: "源码路由：db2.sido.keio.ac.jp"),
-        .init(name: "dcollections.lib.keio.ac.jp", url: "https://dcollections.lib.keio.ac.jp", note: "源码路由：dcollections.lib.keio.ac.jp"),
-        .init(name: "dfz.yn.gov.cn", url: "https://dfz.yn.gov.cn", note: "源码路由：dfz.yn.gov.cn"),
-        .init(name: "digicoll.lib.berkeley.edu", url: "https://digicoll.lib.berkeley.edu", note: "源码路由：digicoll.lib.berkeley.edu"),
-        .init(name: "digitalarchive.npm.gov.tw", url: "https://digitalarchive.npm.gov.tw", note: "GUI/wrapper 专用支持：Collection/Detail 自动转 IIIF manifest"),
-        .init(name: "digital.bodleian.ox.ac.uk", url: "https://digital.bodleian.ox.ac.uk", note: "源码路由：digital.bodleian.ox.ac.uk"),
-        .init(name: "digital.onb.ac.at", url: "https://digital.onb.ac.at", note: "源码路由：digital.onb.ac.at"),
-        .init(name: "digital.staatsbibliothek-berlin.de", url: "https://digital.staatsbibliothek-berlin.de", note: "源码路由：digital.staatsbibliothek-berlin.de"),
-        .init(name: "digitalrepository.lib.hku.hk", url: "https://digitalrepository.lib.hku.hk", note: "源码路由：digitalrepository.lib.hku.hk"),
-        .init(name: "dl.ndl.go.jp", url: "https://dl.ndl.go.jp", note: "源码路由：dl.ndl.go.jp"),
-        .init(name: "dlib.cafa.edu.cn", url: "https://dlib.cafa.edu.cn", note: "源码路由：dlib.cafa.edu.cn"),
-        .init(name: "dlibgate.cafa.edu.cn", url: "https://dlibgate.cafa.edu.cn", note: "源码路由：dlibgate.cafa.edu.cn"),
-        .init(name: "dpul.princeton.edu", url: "https://dpul.princeton.edu", note: "源码路由：dpul.princeton.edu"),
-        .init(name: "dsr.nii.ac.jp", url: "https://dsr.nii.ac.jp", note: "源码路由：dsr.nii.ac.jp"),
-        .init(name: "emuseum.nich.go.jp", url: "https://emuseum.nich.go.jp", note: "源码路由：emuseum.nich.go.jp"),
-        .init(name: "gj.library.sh.cn (上海图书馆古籍)", url: "https://gj.library.sh.cn", note: "GUI/wrapper 专用支持：详情页登录后自动进入阅览；pdfview 走内置专用 PDF 下载"),
-        .init(name: "gj.tianyige.com.cn", url: "https://gj.tianyige.com.cn", note: "源码路由：gj.tianyige.com.cn"),
-        .init(name: "gjsztsg.sdutcm.edu.cn", url: "https://gjsztsg.sdutcm.edu.cn", note: "源码路由：gjsztsg.sdutcm.edu.cn"),
-        .init(name: "guji.nlc.cn", url: "https://guji.nlc.cn", note: "源码路由：guji.nlc.cn"),
-        .init(name: "guji.sdlib.com", url: "https://guji.sdlib.com", note: "源码路由：guji.sdlib.com"),
-        .init(name: "gzdd.gzlib.gov.cn", url: "https://gzdd.gzlib.gov.cn", note: "源码路由：gzdd.gzlib.gov.cn"),
-        .init(name: "gzdd.gzlib.org.cn", url: "https://gzdd.gzlib.org.cn", note: "源码路由：gzdd.gzlib.org.cn"),
-        .init(name: "hannom.nlv.gov.vn", url: "https://hannom.nlv.gov.vn", note: "源码路由：hannom.nlv.gov.vn"),
-        .init(name: "idp.afc.ryukoku.ac.jp", url: "https://idp.afc.ryukoku.ac.jp", note: "源码路由：idp.afc.ryukoku.ac.jp"),
-        .init(name: "idp.bbaw.de", url: "https://idp.bbaw.de", note: "源码路由：idp.bbaw.de"),
-        .init(name: "idp.bl.uk", url: "https://idp.bl.uk", note: "源码路由：idp.bl.uk"),
-        .init(name: "idp.bnf.fr", url: "https://idp.bnf.fr", note: "源码路由：idp.bnf.fr"),
-        .init(name: "idp.korea.ac.kr", url: "https://idp.korea.ac.kr", note: "源码路由：idp.korea.ac.kr"),
-        .init(name: "idp.nlc.cn", url: "https://idp.nlc.cn", note: "源码路由：idp.nlc.cn"),
-        .init(name: "idp.orientalstudies.ru", url: "https://idp.orientalstudies.ru", note: "源码路由：idp.orientalstudies.ru"),
-        .init(name: "ids.si.edu", url: "https://ids.si.edu", note: "源码路由：ids.si.edu"),
-        .init(name: "iiif.lib.harvard.edu", url: "https://iiif.lib.harvard.edu", note: "源码路由：iiif.lib.harvard.edu"),
-        .init(name: "iiif.si.edu", url: "https://iiif.si.edu", note: "源码路由：iiif.si.edu"),
-        .init(name: "jsgxgj.nju.edu.cn", url: "https://jsgxgj.nju.edu.cn", note: "源码路由：jsgxgj.nju.edu.cn"),
-        .init(name: "kanji.zinbun.kyoto-u.ac.jp", url: "https://kanji.zinbun.kyoto-u.ac.jp", note: "源码路由：kanji.zinbun.kyoto-u.ac.jp"),
-        .init(name: "khirin-a.rekihaku.ac.jp", url: "https://khirin-a.rekihaku.ac.jp", note: "源码路由：khirin-a.rekihaku.ac.jp"),
-        .init(name: "kokusho.nijl.ac.jp", url: "https://kokusho.nijl.ac.jp", note: "源码路由：kokusho.nijl.ac.jp"),
-        .init(name: "kostma.korea.ac.kr", url: "https://kostma.korea.ac.kr", note: "源码路由：kostma.korea.ac.kr"),
-        .init(name: "kyudb.snu.ac.kr", url: "https://kyudb.snu.ac.kr", note: "源码路由：kyudb.snu.ac.kr"),
-        .init(name: "lbezone.hkust.edu.hk", url: "https://lbezone.hkust.edu.hk", note: "源码路由：lbezone.hkust.edu.hk"),
-        .init(name: "lib.nomfoundation.org", url: "https://lib.nomfoundation.org", note: "源码路由：lib.nomfoundation.org"),
-        .init(name: "listview.lib.harvard.edu", url: "https://listview.lib.harvard.edu", note: "源码路由：listview.lib.harvard.edu"),
-        .init(name: "lod.nl.go.kr", url: "https://lod.nl.go.kr", note: "源码路由：lod.nl.go.kr"),
-        .init(name: "lswx.tjl.tj.cn:8001", url: "http://lswx.tjl.tj.cn:8001", note: "源码路由：lswx.tjl.tj.cn:8001"),
-        .init(name: "mylib.nlc.cn", url: "https://mylib.nlc.cn", note: "源码路由：mylib.nlc.cn"),
-        .init(name: "ostasien.digitale-sammlungen.de", url: "https://ostasien.digitale-sammlungen.de", note: "源码路由：ostasien.digitale-sammlungen.de"),
-        .init(name: "ouroots.nlc.cn", url: "https://ouroots.nlc.cn", note: "源码路由：ouroots.nlc.cn"),
-        .init(name: "oyjy.wzlib.cn", url: "https://oyjy.wzlib.cn", note: "源码路由：oyjy.wzlib.cn"),
-        .init(name: "qingarchives.npm.edu.tw", url: "https://qingarchives.npm.edu.tw", note: "GUI/wrapper 专用支持：清代档案详情页自动解析并下载"),
-        .init(name: "read.nlc.cn", url: "https://read.nlc.cn", note: "源码路由：read.nlc.cn"),
-        .init(name: "repo.komazawa-u.ac.jp", url: "https://repo.komazawa-u.ac.jp", note: "源码路由：repo.komazawa-u.ac.jp"),
-        .init(name: "repository.lib.cuhk.edu.hk", url: "https://repository.lib.cuhk.edu.hk", note: "源码路由：repository.lib.cuhk.edu.hk"),
-        .init(name: "shanben.ioc.u-tokyo.ac.jp", url: "https://shanben.ioc.u-tokyo.ac.jp", note: "源码路由：shanben.ioc.u-tokyo.ac.jp"),
-        .init(name: "rbook.ncl.edu.tw", url: "https://rbook.ncl.edu.tw", note: "GUI/wrapper 专用支持：SearchDetail 入口走弹窗浏览器抓页下载"),
-        .init(name: "taiwanebook.ncl.edu.tw", url: "https://taiwanebook.ncl.edu.tw", note: "GUI/wrapper 协同支持：登录/验证弹窗浏览器"),
-        .init(name: "viewer.rsl.ru", url: "https://viewer.rsl.ru", note: "源码路由：viewer.rsl.ru"),
-        .init(name: "webarchives.tnm.jp", url: "https://webarchives.tnm.jp", note: "源码路由：webarchives.tnm.jp"),
-        .init(name: "www.bl.uk", url: "https://www.bl.uk", note: "源码路由：www.bl.uk"),
-        .init(name: "www.digital.archives.go.jp", url: "https://www.digital.archives.go.jp", note: "源码路由：www.digital.archives.go.jp"),
-        .init(name: "www.digitale-sammlungen.de", url: "https://www.digitale-sammlungen.de", note: "源码路由：www.digitale-sammlungen.de"),
-        .init(name: "www.familysearch.org", url: "https://www.familysearch.org", note: "源码路由：www.familysearch.org"),
-        .init(name: "www.iiif.ku-orcas.kansai-u.ac.jp", url: "https://www.iiif.ku-orcas.kansai-u.ac.jp", note: "源码路由：www.iiif.ku-orcas.kansai-u.ac.jp"),
-        .init(name: "www.library.yonezawa.yamagata.jp", url: "https://www.library.yonezawa.yamagata.jp", note: "源码路由：www.library.yonezawa.yamagata.jp"),
-        .init(name: "www.loc.gov", url: "https://www.loc.gov", note: "源码路由：www.loc.gov"),
-        .init(name: "www.modernhistory.org.cn", url: "https://www.modernhistory.org.cn", note: "源码路由：www.modernhistory.org.cn"),
-        .init(name: "www.ncpssd.cn", url: "https://www.ncpssd.cn", note: "源码路由：www.ncpssd.cn"),
-        .init(name: "www.ncpssd.org", url: "https://www.ncpssd.org", note: "源码路由：www.ncpssd.org"),
-        .init(name: "www.si.edu", url: "https://www.si.edu", note: "源码路由：www.si.edu"),
-        .init(name: "yun.szlib.org.cn", url: "https://yun.szlib.org.cn", note: "源码路由：yun.szlib.org.cn"),
-        .init(name: "zszy.gslib.com.cn", url: "https://zszy.gslib.com.cn", note: "源码路由：zszy.gslib.com.cn"),
-    ]
+    let supportedSites: [SupportedSite] = SupportedSite.loadBundled()
 
     private let engine = DownloadEngine()
 
@@ -2065,6 +2006,11 @@ struct SupportedSitesSheet: View {
             Text("另有通用模式：`bookget`（通用批量）、`iiif.io`（IIIF 自动检测）、`dzicnlib`（DZI 专用）。")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
+            if sites.isEmpty {
+                Text("未能读取应用包内的 Resources/sites.json，请重新构建应用。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.red)
+            }
 
             TextField("搜索站点名或域名", text: $keyword)
                 .textFieldStyle(.roundedBorder)
@@ -2083,8 +2029,10 @@ struct SupportedSitesSheet: View {
                         Text(site.name)
                             .font(.system(size: 14, weight: .semibold))
                         Spacer()
-                        Link(site.url, destination: URL(string: site.url)!)
-                            .font(.system(size: 12))
+                        if let destination = URL(string: site.url) {
+                            Link(site.url, destination: destination)
+                                .font(.system(size: 12))
+                        }
                     }
                     Text(site.note)
                         .font(.system(size: 12))

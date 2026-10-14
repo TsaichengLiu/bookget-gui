@@ -1,0 +1,166 @@
+{
+  "schemaVersion": 1,
+  "_comment": "Single source of site knowledge for BookGet GUI, bookget-web-login and the bookget wrapper. See README '新增站点'.",
+  "sites": [
+    { "name": "111.7.82.29:8090", "url": "http://111.7.82.29:8090" },
+    { "name": "124.134.220.209:8100", "url": "http://124.134.220.209:8100" },
+    { "name": "arcgxhpv7cw0.db.wzlib.cn", "url": "https://arcgxhpv7cw0.db.wzlib.cn" },
+    { "name": "archive.org", "url": "https://archive.org" },
+    { "name": "archive.wul.waseda.ac.jp", "url": "https://archive.wul.waseda.ac.jp" },
+    { "name": "asia.si.edu", "url": "https://asia.si.edu" },
+    { "name": "babel.hathitrust.org", "url": "https://babel.hathitrust.org" },
+    { "name": "catalog.princeton.edu", "url": "https://catalog.princeton.edu" },
+    { "name": "curiosity.lib.harvard.edu", "url": "https://curiosity.lib.harvard.edu" },
+    { "name": "da.library.ryukoku.ac.jp", "url": "https://da.library.ryukoku.ac.jp" },
+    { "name": "db2.sido.keio.ac.jp", "url": "https://db2.sido.keio.ac.jp" },
+    { "name": "dcollections.lib.keio.ac.jp", "url": "https://dcollections.lib.keio.ac.jp" },
+    { "name": "dfz.yn.gov.cn", "url": "https://dfz.yn.gov.cn" },
+    { "name": "digicoll.lib.berkeley.edu", "url": "https://digicoll.lib.berkeley.edu" },
+    {
+      "id": "npm-digitalarchive",
+      "name": "digitalarchive.npm.gov.tw",
+      "url": "https://digitalarchive.npm.gov.tw",
+      "note": "GUI/wrapper 专用支持：Collection/Detail 自动转 IIIF manifest",
+      "hosts": ["digitalarchive.npm.gov.tw"],
+      "entries": [
+        {
+          "adapter": "npm-digitalarchive-detail",
+          "host": "digitalarchive.npm.gov.tw",
+          "pathPrefixes": ["/collection/detail/"],
+          "entryRewrite": "npm-digitalarchive-manifest"
+        }
+      ]
+    },
+    { "name": "digital.bodleian.ox.ac.uk", "url": "https://digital.bodleian.ox.ac.uk" },
+    { "name": "digital.onb.ac.at", "url": "https://digital.onb.ac.at" },
+    { "name": "digital.staatsbibliothek-berlin.de", "url": "https://digital.staatsbibliothek-berlin.de" },
+    { "name": "digitalrepository.lib.hku.hk", "url": "https://digitalrepository.lib.hku.hk" },
+    { "name": "dl.ndl.go.jp", "url": "https://dl.ndl.go.jp" },
+    { "name": "dlib.cafa.edu.cn", "url": "https://dlib.cafa.edu.cn" },
+    { "name": "dlibgate.cafa.edu.cn", "url": "https://dlibgate.cafa.edu.cn" },
+    { "name": "dpul.princeton.edu", "url": "https://dpul.princeton.edu" },
+    { "name": "dsr.nii.ac.jp", "url": "https://dsr.nii.ac.jp" },
+    { "name": "emuseum.nich.go.jp", "url": "https://emuseum.nich.go.jp" },
+    {
+      "id": "shanghai-library",
+      "name": "gj.library.sh.cn (上海图书馆古籍)",
+      "url": "https://gj.library.sh.cn",
+      "note": "GUI/wrapper 专用支持：详情页登录后自动进入阅览；pdfview 走内置专用 PDF 下载",
+      "hosts": ["gj.library.sh.cn", "dhapi.library.sh.cn"],
+      "pathMarkers": ["/stgj2021/"],
+      "loginAdapter": "shanghaiLibrary",
+      "readerUrlPatterns": {
+        "contains": ["dhapi.library.sh.cn/pdfview", "/stgj2021/book_view/", "/stgj2021/book_page/"],
+        "excludes": ["/pdfview/assets/"]
+      },
+      "entries": [
+        {
+          "adapter": "shanghai-library-detail",
+          "host": "gj.library.sh.cn",
+          "pathPrefixes": ["/org/info/shl"],
+          "requiresPopup": true
+        },
+        {
+          "adapter": "shanghai-library-pdfview",
+          "host": "dhapi.library.sh.cn",
+          "pathPrefixes": ["/pdfview/"],
+          "requiresQuery": true,
+          "downloader": "shanghai-library-pdf"
+        }
+      ]
+    },
+    { "name": "gj.tianyige.com.cn", "url": "https://gj.tianyige.com.cn" },
+    { "name": "gjsztsg.sdutcm.edu.cn", "url": "https://gjsztsg.sdutcm.edu.cn" },
+    { "name": "guji.nlc.cn", "url": "https://guji.nlc.cn" },
+    { "name": "guji.sdlib.com", "url": "https://guji.sdlib.com" },
+    { "name": "gzdd.gzlib.gov.cn", "url": "https://gzdd.gzlib.gov.cn" },
+    { "name": "gzdd.gzlib.org.cn", "url": "https://gzdd.gzlib.org.cn" },
+    { "name": "hannom.nlv.gov.vn", "url": "https://hannom.nlv.gov.vn" },
+    { "name": "idp.afc.ryukoku.ac.jp", "url": "https://idp.afc.ryukoku.ac.jp" },
+    { "name": "idp.bbaw.de", "url": "https://idp.bbaw.de" },
+    { "name": "idp.bl.uk", "url": "https://idp.bl.uk" },
+    { "name": "idp.bnf.fr", "url": "https://idp.bnf.fr" },
+    { "name": "idp.korea.ac.kr", "url": "https://idp.korea.ac.kr" },
+    { "name": "idp.nlc.cn", "url": "https://idp.nlc.cn" },
+    { "name": "idp.orientalstudies.ru", "url": "https://idp.orientalstudies.ru" },
+    { "name": "ids.si.edu", "url": "https://ids.si.edu" },
+    { "name": "iiif.lib.harvard.edu", "url": "https://iiif.lib.harvard.edu" },
+    { "name": "iiif.si.edu", "url": "https://iiif.si.edu" },
+    { "name": "jsgxgj.nju.edu.cn", "url": "https://jsgxgj.nju.edu.cn" },
+    { "name": "kanji.zinbun.kyoto-u.ac.jp", "url": "https://kanji.zinbun.kyoto-u.ac.jp" },
+    { "name": "khirin-a.rekihaku.ac.jp", "url": "https://khirin-a.rekihaku.ac.jp" },
+    { "name": "kokusho.nijl.ac.jp", "url": "https://kokusho.nijl.ac.jp" },
+    { "name": "kostma.korea.ac.kr", "url": "https://kostma.korea.ac.kr" },
+    { "name": "kyudb.snu.ac.kr", "url": "https://kyudb.snu.ac.kr" },
+    { "name": "lbezone.hkust.edu.hk", "url": "https://lbezone.hkust.edu.hk" },
+    { "name": "lib.nomfoundation.org", "url": "https://lib.nomfoundation.org" },
+    { "name": "listview.lib.harvard.edu", "url": "https://listview.lib.harvard.edu" },
+    { "name": "lod.nl.go.kr", "url": "https://lod.nl.go.kr" },
+    { "name": "lswx.tjl.tj.cn:8001", "url": "http://lswx.tjl.tj.cn:8001" },
+    { "name": "mylib.nlc.cn", "url": "https://mylib.nlc.cn" },
+    { "name": "ostasien.digitale-sammlungen.de", "url": "https://ostasien.digitale-sammlungen.de" },
+    { "name": "ouroots.nlc.cn", "url": "https://ouroots.nlc.cn" },
+    { "name": "oyjy.wzlib.cn", "url": "https://oyjy.wzlib.cn" },
+    {
+      "id": "npm-qingarchives",
+      "name": "qingarchives.npm.edu.tw",
+      "url": "https://qingarchives.npm.edu.tw",
+      "note": "GUI/wrapper 专用支持：清代档案详情页自动解析并下载",
+      "hosts": ["qingarchives.npm.edu.tw"],
+      "entries": [
+        {
+          "adapter": "npm-qingarchives-display",
+          "host": "qingarchives.npm.edu.tw",
+          "pathPrefixes": ["/index.php"],
+          "queryPrefixes": ["act=display/image/", "act=display/print/"],
+          "downloader": "qingarchives-display"
+        }
+      ]
+    },
+    { "name": "read.nlc.cn", "url": "https://read.nlc.cn" },
+    { "name": "repo.komazawa-u.ac.jp", "url": "https://repo.komazawa-u.ac.jp" },
+    { "name": "repository.lib.cuhk.edu.hk", "url": "https://repository.lib.cuhk.edu.hk" },
+    { "name": "shanben.ioc.u-tokyo.ac.jp", "url": "https://shanben.ioc.u-tokyo.ac.jp" },
+    {
+      "id": "ncl-rbook",
+      "name": "rbook.ncl.edu.tw",
+      "url": "https://rbook.ncl.edu.tw",
+      "note": "GUI/wrapper 专用支持：SearchDetail 入口走弹窗浏览器抓页下载",
+      "hosts": ["rbook.ncl.edu.tw"],
+      "loginAdapter": "nclRBook",
+      "entries": [
+        {
+          "adapter": "ncl-rbook-searchdetail",
+          "host": "rbook.ncl.edu.tw",
+          "pathPrefixes": ["/nclsearch/search/searchdetail"],
+          "requiresPopup": true,
+          "entryRewrite": "ncl-rbook-resolve",
+          "downloader": "ncl-rbook-scrape"
+        }
+      ]
+    },
+    {
+      "id": "ncl-taiwanebook",
+      "name": "taiwanebook.ncl.edu.tw",
+      "url": "https://taiwanebook.ncl.edu.tw",
+      "note": "GUI/wrapper 协同支持：登录/验证弹窗浏览器",
+      "hosts": ["taiwanebook.ncl.edu.tw"],
+      "loginAdapter": "nclRBook"
+    },
+    { "name": "viewer.rsl.ru", "url": "https://viewer.rsl.ru" },
+    { "name": "webarchives.tnm.jp", "url": "https://webarchives.tnm.jp" },
+    { "name": "www.bl.uk", "url": "https://www.bl.uk" },
+    { "name": "www.digital.archives.go.jp", "url": "https://www.digital.archives.go.jp" },
+    { "name": "www.digitale-sammlungen.de", "url": "https://www.digitale-sammlungen.de" },
+    { "name": "www.familysearch.org", "url": "https://www.familysearch.org" },
+    { "name": "www.iiif.ku-orcas.kansai-u.ac.jp", "url": "https://www.iiif.ku-orcas.kansai-u.ac.jp" },
+    { "name": "www.library.yonezawa.yamagata.jp", "url": "https://www.library.yonezawa.yamagata.jp" },
+    { "name": "www.loc.gov", "url": "https://www.loc.gov" },
+    { "name": "www.modernhistory.org.cn", "url": "https://www.modernhistory.org.cn" },
+    { "name": "www.ncpssd.cn", "url": "https://www.ncpssd.cn" },
+    { "name": "www.ncpssd.org", "url": "https://www.ncpssd.org" },
+    { "name": "www.si.edu", "url": "https://www.si.edu" },
+    { "name": "yun.szlib.org.cn", "url": "https://yun.szlib.org.cn" },
+    { "name": "zszy.gslib.com.cn", "url": "https://zszy.gslib.com.cn" }
+  ]
+}

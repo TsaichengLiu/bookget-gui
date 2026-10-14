@@ -10,6 +10,7 @@ HELPER_SRC="$ROOT_DIR/src/bookget-web-login/main.swift"
 WRAPPER_SRC="$ROOT_DIR/src/bookget-wrapper/bookget"
 HELP_SRC="$ROOT_DIR/docs/BookGetGUIHelp.md"
 HELP_DST="$APP_PATH/Contents/Resources/BookGetGUIHelp.md"
+SITES_SRC="$ROOT_DIR/resources/sites.json"
 TARGET="arm64-apple-macos14.0"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -24,6 +25,7 @@ APP_BIN="$APP_PATH/Contents/MacOS/BookGetGUILauncher"
 HELPER_BIN="$APP_PATH/Contents/Resources/bin/bookget-web-login"
 WRAPPER_BIN="$APP_PATH/Contents/Resources/bin/bookget"
 HELP_DST="$APP_PATH/Contents/Resources/BookGetGUIHelp.md"
+SITES_DST="$APP_PATH/Contents/Resources/sites.json"
 PLIST_PATH="$APP_PATH/Contents/Info.plist"
 mkdir -p "${APP_BIN:h}" "${HELPER_BIN:h}"
 if [[ ! -f "$GUI_SRC" ]]; then
@@ -32,6 +34,10 @@ if [[ ! -f "$GUI_SRC" ]]; then
 fi
 if [[ ! -f "$HELPER_SRC" ]]; then
   echo "helper source not found: $HELPER_SRC" >&2
+  exit 1
+fi
+if [[ ! -f "$SITES_SRC" ]]; then
+  echo "sites.json not found: $SITES_SRC" >&2
   exit 1
 fi
 
@@ -72,6 +78,9 @@ fi
 if [[ -f "$HELP_SRC" ]]; then
   cp "$HELP_SRC" "$HELP_DST"
 fi
+
+echo "[build] copy sites.json..."
+cp "$SITES_SRC" "$SITES_DST"
 
 if [[ -f "$PLIST_PATH" ]]; then
   /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion 14.0" "$PLIST_PATH" >/dev/null 2>&1 || true
