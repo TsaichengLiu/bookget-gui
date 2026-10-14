@@ -19,36 +19,145 @@ struct Args {
     var intervalSeconds: Double = 5.0
 }
 
+// MARK: - Site registry (sites.json)
+
+/// Site knowledge shared with the GUI and the wrapper. The app bundle ships it
+/// as Contents/Resources/sites.json; this helper lives in Resources/bin.
+struct SiteRegistry: Decodable {
+    struct ReaderURLPatterns: Decodable {
+        var contains: [String] = []
+        var excludes: [String] = []
+    }
+
+    /// One special entry page of a site, e.g. a detail page that needs a rewrite.
+    struct Entry: Decodable {
+        let adapter: String
+        let host: String
+        var pathPrefixes: [String]?
+        var queryPrefixes: [String]?
+        var requiresQuery: Bool?
+        var requiresPopup: Bool?
+        var entryRewrite: String?
+        var downloader: String?
+    }
+
+    struct Site: Decodable {
+        var id: String?
+        let name: String
+        var hosts: [String]?
+        var pathMarkers: [String]?
+        var loginAdapter: String?
+        var readerUrlPatterns: ReaderURLPatterns?
+        var entries: [Entry]?
+    }
+
+    struct Match {
+        let site: Site
+        let entry: Entry?
+    }
+
+    let sites: [Site]
+
+    static let shared: SiteRegistry = load()
+
+    private static func candidatePaths() -> [URL] {
+        var result: [URL] = []
+        if let env = ProcessInfo.processInfo.environment["BOOKGET_SITES_JSON"], !env.isEmpty {
+            result.append(URL(fileURLWithPath: env))
+        }
+        if let exe = Bundle.main.executableURL?.resolvingSymlinksInPath() {
+            let dir = exe.deletingLastPathComponent()
+            result.append(dir.deletingLastPathComponent().appendingPathComponent("sites.json"))
+            result.append(dir.appendingPathComponent("sites.json"))
+        }
+        return result
+    }
+
+    static func load() -> SiteRegistry {
+        for path in candidatePaths() {
+            guard let data = try? Data(contentsOf: path) else { continue }
+            do {
+                return try JSONDecoder().decode(SiteRegistry.self, from: data)
+            } catch {
+                FileHandle.standardError.write(Data("[bookget-web-login] invalid \(path.path): \(error)\n".utf8))
+            }
+        }
+        return SiteRegistry(sites: [])
+    }
+
+    var isEmpty: Bool { sites.isEmpty }
+
+    private static func parse(_ urlString: String) -> URLComponents? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let c = URLComponents(string: trimmed), c.host != nil { return c }
+        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed.union(["#", "%"])) ?? trimmed
+        return URLComponents(string: encoded)
+    }
+
+    /// Host suffix match: "rbook.ncl.edu.tw" matches itself and "*.rbook.ncl.edu.tw".
+    static func hostMatches(_ host: String, _ pattern: String) -> Bool {
+        let p = pattern.lowercased()
+        return host == p || host.hasSuffix("." + p)
+    }
+
+    private static func entryMatches(_ entry: Entry, raw: String, host: String, comps: URLComponents) -> Bool {
+        guard hostMatches(host, entry.host) else { return false }
+        if entry.requiresQuery == true, !raw.contains("?") { return false }
+        if let prefixes = entry.pathPrefixes, !prefixes.isEmpty {
+            let path = comps.percentEncodedPath.lowercased()
+            guard prefixes.contains(where: { path.hasPrefix($0.lowercased()) }) else { return false }
+        }
+        if let prefixes = entry.queryPrefixes, !prefixes.isEmpty {
+            // Sites like qingarchives percent-encode the "/" inside act=display/...
+            let query = (comps.percentEncodedQuery ?? "").lowercased().replacingOccurrences(of: "%2f", with: "/")
+            guard prefixes.contains(where: { query.hasPrefix($0.lowercased()) }) else { return false }
+        }
+        return true
+    }
+
+    func match(_ urlString: String) -> Match? {
+        guard let comps = Self.parse(urlString), let host = comps.host?.lowercased(), !host.isEmpty else { return nil }
+        let path = comps.percentEncodedPath.lowercased()
+        var siteOnly: Site?
+        for site in sites {
+            let hostHit = (site.hosts ?? []).contains { Self.hostMatches(host, $0) }
+            let markerHit = (site.pathMarkers ?? []).contains { path.contains($0.lowercased()) }
+            guard hostHit || markerHit else { continue }
+            if let entry = (site.entries ?? []).first(where: { Self.entryMatches($0, raw: urlString, host: host, comps: comps) }) {
+                return Match(site: site, entry: entry)
+            }
+            if siteOnly == nil { siteOnly = site }
+        }
+        return siteOnly.map { Match(site: $0, entry: nil) }
+    }
+
+    func site(id: String) -> Site? {
+        sites.first { $0.id == id }
+    }
+
+    /// Key=value lines for the zsh wrapper (`--detect-site`).
+    func detectReport(_ urlString: String) -> String {
+        let m = match(urlString)
+        let e = m?.entry
+        return [
+            "site=\(m?.site.id ?? "")",
+            "adapter=\(e?.adapter ?? "")",
+            "requires_popup=\(e?.requiresPopup == true ? 1 : 0)",
+            "entry_rewrite=\(e?.entryRewrite ?? "")",
+            "downloader=\(e?.downloader ?? "")",
+            "login_adapter=\(m?.site.loginAdapter ?? "")",
+        ].joined(separator: "\n")
+    }
+}
+
 private enum InteractiveSiteAdapterKind: String {
     case generic
     case shanghaiLibrary
     case nclRBook
 
-    private struct Rule {
-        let kind: InteractiveSiteAdapterKind
-        let patterns: [String]
-    }
-
-    // Keep adapter detection declarative so new interactive sites can be
-    // added by appending one rule instead of editing branching logic.
-    private static let rules: [Rule] = [
-        Rule(kind: .shanghaiLibrary, patterns: [
-            "gj.library.sh.cn",
-            "dhapi.library.sh.cn",
-            "/stgj2021/"
-        ]),
-        Rule(kind: .nclRBook, patterns: [
-            "rbook.ncl.edu.tw",
-            "taiwanebook.ncl.edu.tw"
-        ])
-    ]
-
     static func detect(url: URL) -> InteractiveSiteAdapterKind {
-        let text = url.absoluteString.lowercased()
-        for rule in rules where rule.patterns.contains(where: { text.contains($0) }) {
-            return rule.kind
-        }
-        return .generic
+        guard let raw = SiteRegistry.shared.match(url.absoluteString)?.site.loginAdapter else { return .generic }
+        return InteractiveSiteAdapterKind(rawValue: raw) ?? .generic
     }
 }
 
@@ -65,6 +174,9 @@ private func usage(_ msg: String? = nil) -> Never {
 
       Shanghai Library pdfview fallback:
       bookget-web-login --shl-download --url <https://dhapi.library.sh.cn/pdfview/?...> --out-dir <dir>
+
+      Site detection from sites.json (key=value lines, used by the bookget wrapper):
+      bookget-web-login --detect-site <url>
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
     exit(2)
@@ -754,14 +866,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         super.init()
     }
 
+    private var shanghaiLibraryReaderPatterns: SiteRegistry.ReaderURLPatterns {
+        SiteRegistry.shared.site(id: "shanghai-library")?.readerUrlPatterns ?? SiteRegistry.ReaderURLPatterns()
+    }
+
     private func isShanghaiLibraryReaderURL(_ urlString: String) -> Bool {
         let lc = urlString.lowercased()
-        if lc.contains("/pdfview/assets/") || lc.hasSuffix(".js") || lc.hasSuffix(".css") || lc.hasSuffix(".map") {
+        if lc.hasSuffix(".js") || lc.hasSuffix(".css") || lc.hasSuffix(".map") {
             return false
         }
-        return lc.contains("dhapi.library.sh.cn/pdfview")
-            || lc.contains("/stgj2021/book_view/")
-            || lc.contains("/stgj2021/book_page/")
+        let patterns = shanghaiLibraryReaderPatterns
+        if patterns.excludes.contains(where: { lc.contains($0.lowercased()) }) {
+            return false
+        }
+        return patterns.contains.contains { lc.contains($0.lowercased()) }
     }
 
     private func rememberMeaningfulShanghaiLibraryReaderURL(_ url: URL?) {
@@ -1074,8 +1192,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 completion(remembered)
                 return
             }
+            let patterns = self.shanghaiLibraryReaderPatterns
+            func jsArray(_ items: [String]) -> String {
+                let data = (try? JSONSerialization.data(withJSONObject: items.map { $0.lowercased() })) ?? Data("[]".utf8)
+                return String(data: data, encoding: .utf8) ?? "[]"
+            }
             let js = #"""
             (function() {
+              var readerContains = \#(jsArray(patterns.contains));
+              var readerExcludes = \#(jsArray(patterns.excludes));
+              function hasAny(lc, list) {
+                for (var j = 0; j < list.length; j++) { if (lc.indexOf(list[j]) !== -1) return true; }
+                return false;
+              }
               function normalize(url, base) {
                 try { return new URL(url || window.location.href, base || window.location.href).toString(); }
                 catch (e) { return ""; }
@@ -1092,8 +1221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 var abs = normalize(candidates[i], window.location.href);
                 if (!abs) continue;
                 var lc = abs.toLowerCase();
-                if (lc.indexOf('/pdfview/assets/') !== -1) continue;
-                if ((lc.indexOf('dhapi.library.sh.cn/pdfview') !== -1 || lc.indexOf('/stgj2021/book_view/') !== -1 || lc.indexOf('/stgj2021/book_page/') !== -1) && abs.indexOf('?') !== -1) {
+                if (hasAny(lc, readerExcludes)) continue;
+                if (hasAny(lc, readerContains) && abs.indexOf('?') !== -1) {
                   return abs;
                 }
               }
@@ -1107,8 +1236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
 
         func isShanghaiLibraryDetailPage(_ urlString: String, html: String?) -> Bool {
-            let lc = urlString.lowercased()
-            if lc.contains("gj.library.sh.cn/org/info/shl") {
+            if SiteRegistry.shared.match(urlString)?.entry?.adapter == "shanghai-library-detail" {
                 return true
             }
             guard let html else { return false }
@@ -1500,6 +1628,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             }
         }
     }
+}
+
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--detect-site" {
+    guard CommandLine.arguments.count >= 3 else { usage("Missing value for --detect-site") }
+    let registry = SiteRegistry.shared
+    if registry.isEmpty {
+        FileHandle.standardError.write(Data("[bookget-web-login] sites.json not found or empty\n".utf8))
+        exit(3)
+    }
+    print(registry.detectReport(CommandLine.arguments[2]))
+    exit(0)
 }
 
 let args = parseArgs()

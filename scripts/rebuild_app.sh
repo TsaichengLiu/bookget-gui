@@ -9,6 +9,8 @@ GUI_SRC="$ROOT_DIR/tools/gui-src/bookget_gui_app.swift"
 HELPER_SRC="$ROOT_DIR/tools/bookget-web-login/main.swift"
 HELP_SRC="$ROOT_DIR/tools/BookGetGUIHelp.md"
 HELP_DST="$APP_PATH/Contents/Resources/BookGetGUIHelp.md"
+SITES_SRC="$ROOT_DIR/resources/sites.json"
+SITES_DST="$APP_PATH/Contents/Resources/sites.json"
 PLIST_PATH="$APP_PATH/Contents/Info.plist"
 TARGET="arm64-apple-macos14.0"
 
@@ -25,6 +27,10 @@ if [[ ! -f "$GUI_SRC" ]]; then
 fi
 if [[ ! -f "$HELPER_SRC" ]]; then
   echo "helper source not found: $HELPER_SRC" >&2
+  exit 1
+fi
+if [[ ! -f "$SITES_SRC" ]]; then
+  echo "sites.json not found: $SITES_SRC" >&2
   exit 1
 fi
 
@@ -59,6 +65,9 @@ chmod +x "$HELPER_BIN"
 if [[ -f "$HELP_SRC" ]]; then
   cp "$HELP_SRC" "$HELP_DST"
 fi
+
+echo "[build] copy sites.json..."
+cp "$SITES_SRC" "$SITES_DST"
 
 if [[ -f "$PLIST_PATH" ]]; then
   /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion 14.0" "$PLIST_PATH" >/dev/null 2>&1 || true

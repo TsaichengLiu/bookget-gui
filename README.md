@@ -37,14 +37,12 @@ BookGet 的 macOS 圖形界面封裝，基於 SwiftUI，雙欄單窗口佈局。
 
 ## 新站點接入接口（統一流程）
 
-新增站點按同一條鏈路接入，不需要在多處重複寫分支：
+站點知識只寫在一處：`resources/sites.json`（構建時拷貝到 `Contents/Resources/sites.json`）。GUI 的「支持網站」清單、彈窗瀏覽器 helper、wrapper 都從這裏讀取；wrapper 通過 `bookget-web-login --detect-site <url>` 取得識別結果。
 
-1. 在 wrapper（`src/bookget-wrapper/bookget`）的 `special_site_adapter_for_url()` 註冊站點識別規則。
-2. 在 `special_site_requires_popup_for_adapter()` 聲明是否強制彈窗瀏覽器。
-3. 若入口鏈接需要改寫，在 `resolve_special_entry_url()` 添加該 adapter 的入口解析。
-4. 若 `bookget-core` 不支持，在 `run_special_site_adapter_if_needed()` 添加專用下載器分發。
-5. 若涉及彈窗瀏覽器中的站點識別，追加 `src/bookget-web-login/main.swift` 裏 `InteractiveSiteAdapterKind.rules` 規則。
-6. 在 GUI 的 `supportedSites` 清單（`src/BookGetGUILauncher/bookget_gui_app.swift`）和幫助文檔同步補說明。
+1. 在 `sites.json` 加一條站點：`name`/`url`/`note`（GUI 顯示）、`hosts`（按域名後綴匹配）、可選 `loginAdapter`（彈窗瀏覽器提示）。若需專用處理，再加 `entries`：`host` + `pathPrefixes`/`queryPrefixes` 定位入口頁，`requiresPopup` 強制彈窗，`entryRewrite` 指定入口改寫，`downloader` 指定專用下載器。
+2. 只有當需要**新的** `entryRewrite` / `downloader` 類型時，才在 wrapper 的 `resolve_special_entry_url()` / `run_special_site_adapter_if_needed()` 加一個 `case` 分支實現它；已有類型直接在 JSON 裏引用即可。
+
+自測：`BOOKGET_SITES_JSON=resources/sites.json ./bookget-web-login --detect-site '<url>'`。
 
 ---
 
@@ -110,6 +108,7 @@ open "BookGet GUI.app"
    腳本會：
    - `swiftc` 編譯 `src/BookGetGUILauncher/bookget_gui_app.swift` → `Contents/MacOS/BookGetGUILauncher`
    - `swiftc` 編譯 `src/bookget-web-login/main.swift` → `Contents/Resources/bin/bookget-web-login`
+   - 拷貝 `resources/sites.json` → `Contents/Resources/sites.json`
    - `codesign --force --deep --sign -` 做 ad-hoc 簽名
    - 自動備份當前二進制為 `*.bak.YYYYmmdd_HHMMSS`
 
@@ -129,6 +128,8 @@ bookget-gui/
 │   │   └── main.swift                      # 彈窗瀏覽器 + 專用下載器
 │   └── bookget-wrapper/
 │       └── bookget                         # zsh 包裝器，負責站點識別、入口改寫、專用分發
+├── resources/
+│   └── sites.json                          # 站點清單與識別規則（GUI / helper / wrapper 共用）
 ├── docs/
 │   ├── BookGetGUIHelp.md                   # 內置幫助（會被拷貝進 .app/Resources）
 │   └── 使用说明-GUI.md

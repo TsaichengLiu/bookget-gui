@@ -180,58 +180,51 @@ should_prelogin() {
   return $?
 }
 
-is_shanghai_library_detail_url() {
+# Site knowledge lives in Resources/sites.json; the login helper parses it and
+# answers with key=value lines. Results are cached per URL (outside subshells).
+typeset -gA SITE_DETECT_CACHE
+SITE_DETECT_WARNED=0
+
+detect_site_for_url() {
   local url="$1"
-  local lc="${url:l}"
-  [[ "$lc" == *"gj.library.sh.cn/org/info/shl"* ]]
-}
+  local helper="$SCRIPT_DIR/bookget-web-login"
+  local out="" line
 
-is_shanghai_library_pdfview_url() {
-  local url="$1"
-  local lc="${url:l}"
-  [[ "$lc" == *"dhapi.library.sh.cn/pdfview/"* && "$url" == *\?* ]]
-}
+  SITE_ID=""
+  SITE_ADAPTER=""
+  SITE_REQUIRES_POPUP=0
+  SITE_ENTRY_REWRITE=""
+  SITE_DOWNLOADER=""
+  [[ -n "$url" ]] || return 0
 
-special_site_adapter_for_url() {
-  local url="$1"
+  if (( ${+SITE_DETECT_CACHE[$url]} )); then
+    out="${SITE_DETECT_CACHE[$url]}"
+  else
+    if [[ -x "$helper" ]]; then
+      out="$("$helper" --detect-site "$url" 2>/dev/null)" || out=""
+    fi
+    if [[ -z "$out" ]] && (( SITE_DETECT_WARNED == 0 )); then
+      SITE_DETECT_WARNED=1
+      echo "[bookget wrapper] site detection unavailable (missing $helper or sites.json); special-site adapters disabled" >&2
+    fi
+    SITE_DETECT_CACHE[$url]="$out"
+  fi
 
-  if is_shanghai_library_detail_url "$url"; then
-    print -r -- "shanghai-library-detail"
-    return 0
-  fi
-  if is_shanghai_library_pdfview_url "$url"; then
-    print -r -- "shanghai-library-pdfview"
-    return 0
-  fi
-  if is_qingarchives_display_url "$url"; then
-    print -r -- "npm-qingarchives-display"
-    return 0
-  fi
-  if is_ncl_rbook_searchdetail_url "$url"; then
-    print -r -- "ncl-rbook-searchdetail"
-    return 0
-  fi
-  if is_npm_digitalarchive_detail_url "$url"; then
-    print -r -- "npm-digitalarchive-detail"
-    return 0
-  fi
-  print -r -- ""
-}
-
-special_site_requires_popup_for_adapter() {
-  local adapter="$1"
-  case "$adapter" in
-    shanghai-library-detail|ncl-rbook-searchdetail)
-      return 0
-      ;;
-  esac
-  return 1
+  for line in "${(@f)out}"; do
+    case "$line" in
+      site=*) SITE_ID="${line#*=}" ;;
+      adapter=*) SITE_ADAPTER="${line#*=}" ;;
+      requires_popup=*) SITE_REQUIRES_POPUP="${line#*=}" ;;
+      entry_rewrite=*) SITE_ENTRY_REWRITE="${line#*=}" ;;
+      downloader=*) SITE_DOWNLOADER="${line#*=}" ;;
+    esac
+  done
+  [[ "$SITE_REQUIRES_POPUP" == 1 ]] || SITE_REQUIRES_POPUP=0
 }
 
 should_force_popup_browser_for_url() {
-  local adapter
-  adapter="$(special_site_adapter_for_url "$1")"
-  special_site_requires_popup_for_adapter "$adapter"
+  detect_site_for_url "$1"
+  (( SITE_REQUIRES_POPUP == 1 ))
 }
 
 run_shanghai_library_pdf_download() {
@@ -255,23 +248,24 @@ run_shanghai_library_pdf_download() {
 
 run_special_site_adapter_if_needed() {
   local url="$1"
-  local adapter="${2:-}"
+  local downloader="${2:-}"
   local strict_login_required="${3:-1}"
 
-  if [[ -z "$adapter" ]]; then
-    adapter="$(special_site_adapter_for_url "$url")"
+  if [[ -z "$downloader" ]]; then
+    detect_site_for_url "$url"
+    downloader="$SITE_DOWNLOADER"
   fi
 
-  case "$adapter" in
-    shanghai-library-pdfview)
+  case "$downloader" in
+    shanghai-library-pdf)
       run_shanghai_library_pdf_download "$url"
       return $?
       ;;
-    npm-qingarchives-display)
+    qingarchives-display)
       run_qingarchives_display_download "$url"
       return $?
       ;;
-    ncl-rbook-searchdetail)
+    ncl-rbook-scrape)
       if should_prelogin; then
         run_rbook_scrape "$url"
         return $?
@@ -1338,15 +1332,6 @@ resolve_iiif_manifest_url() {
   fi
 }
 
-is_qingarchives_display_url() {
-  local url="$1"
-  local normalized lc
-
-  normalized="$(printf '%s' "$url" | sed -E 's/%2[Ff]/\//g')"
-  lc="${normalized:l}"
-  [[ "$lc" == *"qingarchives.npm.edu.tw/index.php?act=display/image/"* || "$lc" == *"qingarchives.npm.edu.tw/index.php?act=display/print/"* ]]
-}
-
 extract_qingarchives_object_code() {
   local url="$1"
   local normalized obj
@@ -1750,12 +1735,6 @@ build_cookie_header_from_file() {
   ' "$cookie_file"
 }
 
-is_ncl_rbook_searchdetail_url() {
-  local url="$1"
-  local lc="${url:l}"
-  [[ "$lc" == *"rbook.ncl.edu.tw/nclsearch/search/searchdetail"* ]]
-}
-
 extract_query_param() {
   local url="$1"
   local key="$2"
@@ -1876,11 +1855,6 @@ resolve_ncl_rbook_url() {
   local page candidate resolved cookie_file cookie_header
   local curl_args
   local tmpd url_file marker_file fetched_file
-
-  if ! is_ncl_rbook_searchdetail_url "$url"; then
-    print -r -- "$url"
-    return 0
-  fi
 
   if ! command -v curl >/dev/null 2>&1; then
     : # still attempt core-based fetch below
@@ -2018,20 +1992,9 @@ resolve_ncl_rbook_url() {
   print -r -- "$url"
 }
 
-is_npm_digitalarchive_detail_url() {
-  local url="$1"
-  local lc="${url:l}"
-  [[ "$lc" == *"digitalarchive.npm.gov.tw/collection/detail/"* ]]
-}
-
 resolve_npm_digitalarchive_manifest_url() {
   local url="$1"
   local cid dep manifest
-
-  if ! is_npm_digitalarchive_detail_url "$url"; then
-    print -r -- "$url"
-    return 0
-  fi
 
   cid="$(printf '%s' "$url" | sed -nE 's#.*[Cc]ollection/[Dd]etail/([0-9]+).*#\1#p' | head -n 1)"
   dep="$(printf '%s' "$url" | sed -nE 's#.*[?&][Dd][Ee][Pp]=([^&#]+).*#\1#p' | head -n 1)"
@@ -2050,15 +2013,14 @@ resolve_npm_digitalarchive_manifest_url() {
 
 resolve_special_entry_url() {
   local url="$1"
-  local adapter
   local resolved="$url"
 
-  adapter="$(special_site_adapter_for_url "$url")"
-  case "$adapter" in
-    ncl-rbook-searchdetail)
+  detect_site_for_url "$url"
+  case "$SITE_ENTRY_REWRITE" in
+    ncl-rbook-resolve)
       resolved="$(resolve_ncl_rbook_url "$url")"
       ;;
-    npm-digitalarchive-detail)
+    npm-digitalarchive-manifest)
       resolved="$(resolve_npm_digitalarchive_manifest_url "$url")"
       ;;
     *)
