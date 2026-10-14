@@ -35,3 +35,6 @@ DerivedData/
 .vscode/
 *.swp
 *~
+
+# rebuild_app.sh keeps previous binaries here
+build-backups/

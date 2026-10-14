@@ -169,20 +169,49 @@ parent_domain_key() {
   print -r -- "$parent"
 }
 
+# `defaults read` spawns cfprefsd round-trips; the GUI writes the value before
+# launching us, so read it once per process. Callers must not use $(...) to
+# warm the cache (a subshell would discard it); top level warms it below.
+DEFAULTS_LOGIN_REQUIRED_CACHE=""
+
 defaults_login_required() {
   local raw=""
 
-  command -v defaults >/dev/null 2>&1 || return 1
-  raw="$(defaults read "$DEFAULTS_DOMAIN" "$DEFAULTS_KEY_NEED_LOGIN" 2>/dev/null || true)"
-  raw="${raw//$'\r'/}"
-  raw="${raw//$'\n'/}"
-  raw="${raw:l}"
+  if [[ -z "$DEFAULTS_LOGIN_REQUIRED_CACHE" ]]; then
+    DEFAULTS_LOGIN_REQUIRED_CACHE=0
+    if command -v defaults >/dev/null 2>&1; then
+      raw="$(defaults read "$DEFAULTS_DOMAIN" "$DEFAULTS_KEY_NEED_LOGIN" 2>/dev/null || true)"
+      raw="${raw//$'\r'/}"
+      raw="${raw//$'\n'/}"
+      raw="${raw:l}"
+      case "$raw" in
+        1|true|yes) DEFAULTS_LOGIN_REQUIRED_CACHE=1 ;;
+      esac
+    fi
+  fi
+  (( DEFAULTS_LOGIN_REQUIRED_CACHE == 1 ))
+}
 
-  case "$raw" in
-    1|true|yes) return 0 ;;
-    0|false|no) return 1 ;;
+# bookget-web-login exit codes: 0 ok, 2 user cancelled, 64 bad arguments
+# (usage error, i.e. a wrapper/helper version mismatch). Maps 2 -> 130 so the
+# GUI shows "cancelled" instead of a failure.
+map_helper_exit_code() {
+  local what="$1"
+  local rc="$2"
+
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      echo "[bookget wrapper] $what cancelled by user (exit=2)" >&2
+      return 130
+      ;;
+    64)
+      echo "[bookget wrapper] $what rejected its arguments (exit=64); the helper may not match this wrapper version" >&2
+      return 1
+      ;;
   esac
-  return 1
+  echo "[bookget wrapper] $what failed (exit=$rc)" >&2
+  return $rc
 }
 
 should_prelogin() {
@@ -258,6 +287,7 @@ run_shanghai_library_pdf_download() {
 
   echo "[bookget wrapper] using Shanghai Library PDF fallback downloader..." >&2
   "$helper" --shl-download --url "$url" --out-dir "$target_output_dir"
+  map_helper_exit_code "Shanghai Library downloader" $?
 }
 
 run_special_site_adapter_if_needed() {
@@ -403,11 +433,28 @@ is_positive_interval_value() {
   [[ "$interval" != "0" && "$interval" != "0.0" ]]
 }
 
+# A core progress line ("Get 3/120 https://...") starts a page request; pause
+# after it. Go transport errors also start with Get: `Get "https://x": dial
+# tcp ...` -- pausing on those only delays the failure, so skip them.
+is_interval_trigger_line() {
+  local line="$1"
+  local lower="${line:l}"
+
+  [[ "$line" == *"Get "*"/"* ]] || return 1
+  [[ "$line" == *'Get "'*'": '* ]] && return 1
+  case "$lower" in
+    *"dial tcp"*|*timeout*|*"timed out"*|*" eof"|*" eof "*|*": eof"*|*"connection refused"*|*"connection reset"*|*"no such host"*|*"deadline exceeded"*|*"network is unreachable"*|*error*|*失败*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 run_core_with_optional_get_interval() {
   local url="$1"
   local log_file="$2"
   local args_name="$3"
-  local interval fifo pid line output_code=0
+  local interval fifo fifo_dir pid line output_code=0
   local -a cmd_args
 
   cmd_args=("${(@P)args_name}")
@@ -428,10 +475,15 @@ run_core_with_optional_get_interval() {
     : > "$log_file"
   fi
 
-  fifo="$(mktemp -u "${TMPDIR:-/tmp}/bookget-stream.XXXXXX" 2>/dev/null)"
-  [[ -n "$fifo" ]] || return 99
-  mkfifo "$fifo" 2>/dev/null || return 99
-  AUTO_COOKIE_TEMP_FILES+=("$fifo")
+  # mktemp -u + mkfifo races with other processes; a private 0700 dir does not.
+  fifo_dir="$(mktemp -d "${TMPDIR:-/tmp}/bookget-stream.XXXXXX" 2>/dev/null)" || fifo_dir=""
+  [[ -n "$fifo_dir" ]] || return 99
+  AUTO_COOKIE_TEMP_FILES+=("$fifo_dir")
+  fifo="$fifo_dir/stream"
+  mkfifo -m 600 "$fifo" 2>/dev/null || {
+    rm -rf -- "$fifo_dir"
+    return 99
+  }
 
   "$CORE_BIN" "${cmd_args[@]}" >"$fifo" 2>&1 &
   pid=$!
@@ -442,7 +494,7 @@ run_core_with_optional_get_interval() {
       print -r -- "$line" >> "$log_file"
     fi
 
-    if [[ "$line" == *"Get "*"/"* ]]; then
+    if is_interval_trigger_line "$line"; then
       kill -STOP "$pid" >/dev/null 2>&1 || true
       sleep "$interval"
       kill -CONT "$pid" >/dev/null 2>&1 || true
@@ -451,7 +503,7 @@ run_core_with_optional_get_interval() {
 
   wait "$pid"
   output_code=$?
-  rm -f "$fifo"
+  rm -rf -- "$fifo_dir"
   return $output_code
 }
 
@@ -496,12 +548,12 @@ interactive_capture_cookie_for_url() {
     "$helper" --url "$url" --cookie-out "$cookie_file" >/dev/null
   fi
   rc=$?
-  if (( rc == 2 )); then
-    echo "[bookget wrapper] login window cancelled (exit=$rc)" >&2
+  map_helper_exit_code "login window" $rc
+  rc=$?
+  if (( rc == 130 )); then
     return 130
   fi
   if (( rc != 0 )); then
-    echo "[bookget wrapper] login window failed (exit=$rc)" >&2
     return 1
   fi
   if [[ ! -s "$cookie_file" ]]; then
@@ -590,7 +642,8 @@ run_single_url_with_login_retry() {
   fi
 
   # After prelogin, cookies may exist; re-resolve entry URL for sites that require auth.
-  resolved_url="$(resolve_special_entry_url "$url_work")"
+  resolve_special_entry_url_cached "$url_work"
+  resolved_url="$REPLY"
   if [[ -n "$resolved_url" && "$resolved_url" != "$url_work" ]]; then
     echo "[bookget wrapper] resolved site entry URL after prelogin: $resolved_url" >&2
     url_work="$resolved_url"
@@ -625,7 +678,8 @@ run_single_url_with_login_retry() {
     retry_url="$login_url"
   fi
 
-  resolved_url="$(resolve_special_entry_url "$retry_url")"
+  resolve_special_entry_url_cached "$retry_url"
+  resolved_url="$REPLY"
   if [[ -n "$resolved_url" && "$resolved_url" != "$retry_url" ]]; then
     echo "[bookget wrapper] resolved site entry URL after login: $resolved_url" >&2
     retry_url="$resolved_url"
@@ -826,6 +880,30 @@ has_transport_error_in_log() {
   grep -Eiq \
     '(^|[[:space:]])(Get|Post|Head) "[^"]+": (dial tcp|lookup [^:[:space:]]+:[[:space:]]*no such host|no such host|i/o timeout|context deadline exceeded|tls handshake timeout|connection refused|connection reset|no route to host|network is unreachable|server misbehaving|eof)' \
     "$log_file"
+}
+
+# True when the core finished without writing anything new because the pages
+# were already on disk (resume), as opposed to a name clash it could not
+# resolve. Evidence: an explicit skip/exists line, or a normal completion line
+# while the output dir already holds downloaded files in a book subfolder.
+core_log_shows_existing_output() {
+  local log_file="$1"
+  local dir_path="$2"
+  local f
+
+  [[ -n "$log_file" && -s "$log_file" ]] || return 1
+
+  if grep -Eiq '已存在|已经存在|已下载|跳过|already (exists|downloaded)|file exists|exists[,.;:]? *skip|(^|[^a-z])skip(ped|ping)?([^a-z]|$)' "$log_file"; then
+    return 0
+  fi
+
+  if grep -Eiq 'download complete|下载完成' "$log_file"; then
+    [[ -d "$dir_path" ]] || return 1
+    while IFS= read -r -d '' f; do
+      is_downloader_output_file "$f" && return 0
+    done < <(find "$dir_path" -mindepth 2 -maxdepth 4 -type f -print0 2>/dev/null)
+  fi
+  return 1
 }
 
 # Conflict fallback: write directly to a renamed output subfolder
@@ -1115,14 +1193,18 @@ run_single_url() {
     args=("-dzi=$dzi_override" "${args[@]}")
   fi
 
-  if [[ -n "$mode_override" ]]; then
-    log_file="$(mktemp "${TMPDIR:-/tmp}/bookget-log.XXXXXX")" || {
-      rm -f "$marker_file" "$tmp_file"
-      return 99
-    }
+  # Always capture the core log (tee keeps it streaming to stdout live): the
+  # "no new output" check below needs it to tell a resume from a name clash.
+  log_file="$(mktemp "${TMPDIR:-/tmp}/bookget-log.XXXXXX" 2>/dev/null)" || log_file=""
+  if [[ -n "$log_file" ]]; then
     AUTO_COOKIE_TEMP_FILES+=("$log_file")
-    run_core_with_optional_get_interval "$url" "$log_file" args
-    output_code=$?
+  elif [[ -n "$mode_override" ]]; then
+    rm -f "$marker_file" "$tmp_file"
+    return 99
+  fi
+  run_core_with_optional_get_interval "$url" "$log_file" args
+  output_code=$?
+  if [[ -n "$mode_override" && -n "$log_file" ]]; then
     if (( output_code == 0 )) && grep -Eiq "Unsupported URL|处理URL失败|task panic recovered|panic: runtime error" "$log_file"; then
       output_code=99
     fi
@@ -1130,10 +1212,12 @@ run_single_url() {
       echo "[bookget wrapper] transport/network error detected in downloader log" >&2
       output_code=96
     fi
-    rm -f "$log_file"
-  else
-    run_core_with_optional_get_interval "$url" "" args
-    output_code=$?
+  fi
+  # A core that failed outright on network errors: report it as such (96) so
+  # auto mode stops trying other modes and the GUI shows a network reason.
+  if (( output_code != 0 && output_code != 96 && output_code < 128 )) && [[ -n "$log_file" ]] && has_transport_error_in_log "$log_file"; then
+    echo "[bookget wrapper] downloader failed with transport/network errors (exit=$output_code)" >&2
+    output_code=96
   fi
 
   if (( output_code == 0 )); then
@@ -1145,9 +1229,16 @@ run_single_url() {
       remove_new_files_since_marker "$target_output_dir" "$marker_file"
       output_code=95
     elif (( new_status == 2 )); then
-      echo "[bookget wrapper] no new visible output, retry with conflict-safe save" >&2
-      run_single_url_temp_merge "$url" "$mode_override" "$dzi_override" "$target_output_dir"
-      output_code=$?
+      if core_log_shows_existing_output "$log_file" "$target_output_dir"; then
+        # Typical after pause/resume: every page is already on disk and the core
+        # skipped it. Re-running into bookget_dup_N would download the whole
+        # book again, so treat this as success.
+        echo "[bookget wrapper] no new files: the downloader reports these pages were downloaded before (resume); nothing to redo" >&2
+      else
+        echo "[bookget wrapper] no new visible output, retry with conflict-safe save" >&2
+        run_single_url_temp_merge "$url" "$mode_override" "$dzi_override" "$target_output_dir"
+        output_code=$?
+      fi
     fi
   fi
 
@@ -1156,6 +1247,7 @@ run_single_url() {
   fi
 
   rm -f "$marker_file" "$tmp_file"
+  [[ -n "$log_file" ]] && rm -f "$log_file"
   return $output_code
 }
 
@@ -1173,8 +1265,8 @@ run_mode2_with_dzi_fallback() {
   echo "[bookget wrapper] mode -a 2 prefers -dzi=false for progress-style logs" >&2
   run_single_url_with_login_retry "$url" "$mode" "false"
   code=$?
-  if (( code == 0 )); then
-    return 0
+  if (( code == 0 || code == 130 || code == 96 )); then
+    return $code
   fi
 
   echo "[bookget wrapper] -a 2 with -dzi=false failed, fallback to -dzi=true" >&2
@@ -1189,6 +1281,7 @@ run_single_url_with_auto_modes() {
   local resolved_url
   local code
   local special_code=0
+  local final_code=1
 
   run_special_site_adapter_if_needed "$original_url" "" "0"
   special_code=$?
@@ -1218,6 +1311,7 @@ run_single_url_with_auto_modes() {
         return 0
       fi
       echo "[bookget wrapper] auto mode -a $mode failed for: $original_url (exit=$code)" >&2
+      (( final_code == 95 )) || final_code=$code
       continue
     fi
 
@@ -1235,9 +1329,39 @@ run_single_url_with_auto_modes() {
       return 0
     fi
     echo "[bookget wrapper] auto mode -a $mode failed for: $original_url (exit=$code)" >&2
+    # Keep a login/verification failure (95) over later "unsupported" codes:
+    # it is the actionable reason.
+    (( final_code == 95 )) || final_code=$code
   done
 
-  return 1
+  return $final_code
+}
+
+# Exit codes used in this script: 94 cannot parse the URL, 95 got an HTML
+# login/verification page instead of images, 96 network error, 97 cannot
+# create output/marker, 98 nothing downloaded, 99 core rejected the URL or
+# crashed. One Chinese line the GUI can surface; called only for final failures.
+print_failure_reason() {
+  local code="$1"
+  local url="${2:-}"
+  local reason
+
+  case "$code" in
+    0|130) return 0 ;;
+    94) reason="不支持的网址（无法解析网址中的书籍编号）" ;;
+    95) reason="需要登录或验证（下载到的是网页而非图片，请开启登录/验证后重试）" ;;
+    96) reason="网络错误（连接失败或超时，请检查网络后重试）" ;;
+    97) reason="无法写入输出目录（请检查保存位置的权限）" ;;
+    98) reason="下载内容无效（没有得到任何文件）" ;;
+    99) reason="不支持的网址（下载器无法识别或处理该网址）" ;;
+    127) reason="缺少下载组件（bookget-core 未找到）" ;;
+    *) reason="下载失败（返回码 $code）" ;;
+  esac
+  if [[ -n "$url" ]]; then
+    echo "[bookget wrapper] 失败原因：$reason — $url" >&2
+  else
+    echo "[bookget wrapper] 失败原因：$reason" >&2
+  fi
 }
 
 urls=()
@@ -1850,10 +1974,7 @@ run_rbook_scrape() {
   rc=$?
   trap on_wrapper_signal TERM INT HUP
 
-  if (( rc == 2 )); then
-    return 130
-  fi
-  return $rc
+  map_helper_exit_code "rbook WebView scrape" $rc
 }
 
 extract_ncl_view_candidate_from_page() {
@@ -2043,6 +2164,36 @@ resolve_npm_digitalarchive_manifest_url() {
   print -r -- "$manifest"
 }
 
+# Entry-URL resolution can cost 20-45s of network time (curl plus a core
+# fetch), and every auto-mode attempt (-a 0/1/2, dzi) asks again. Cache per
+# input URL for this process; the key includes the auto cookie in effect,
+# because a login can change what the site resolves to. Sets REPLY; must not
+# be called inside $(...) or the cache entry is lost.
+typeset -gA RESOLVED_ENTRY_URL_CACHE
+
+resolve_special_entry_url_cached() {
+  local url="$1"
+  local host parent cookie key
+
+  host="$(url_host_key "$url")"
+  parent="$(parent_domain_key "$host")"
+  cookie="${AUTO_COOKIE_BY_HOST[$host]:-}"
+  if [[ -z "$cookie" && -n "$parent" ]]; then
+    cookie="${AUTO_COOKIE_BY_HOST[$parent]:-}"
+  fi
+  key="${url}|${cookie}"
+
+  if (( ${+RESOLVED_ENTRY_URL_CACHE[$key]} )); then
+    REPLY="${RESOLVED_ENTRY_URL_CACHE[$key]}"
+    return 0
+  fi
+  # Warm the site-detection cache in this shell so the subshell below reuses it.
+  detect_site_for_url "$url"
+  REPLY="$(resolve_special_entry_url "$url")"
+  [[ -n "$REPLY" ]] || REPLY="$url"
+  RESOLVED_ENTRY_URL_CACHE[$key]="$REPLY"
+}
+
 resolve_special_entry_url() {
   local url="$1"
   local resolved="$url"
@@ -2101,7 +2252,9 @@ read_wrapper_dzi_choice_from_config() {
 # Priority:
 # 1) URLs from -i file.
 # 2) URLs passed directly in argv.
-# 3) Default urls.txt as fallback for GUI variants.
+# 3) Default urls.txt as fallback for GUI variants -- only when neither -i nor
+#    argv supplied a URL; otherwise a stale urls.txt in the cwd (the GUI runs
+#    us from BookgetRuntime) would turn a single task into a batch.
 if [[ -n "$input_file" ]]; then
   load_urls_from_file "$input_file"
 fi
@@ -2111,11 +2264,14 @@ fi
 if (( ${#urls[@]} <= 1 )) && (( ${#cli_urls[@]} > 1 )); then
   urls=("${cli_urls[@]}")
 fi
-if (( ${#urls[@]} <= 1 )); then
+if (( ${#urls[@]} == 0 )) && (( ${#cli_urls[@]} == 0 )) && [[ -z "$input_file" ]]; then
   load_urls_from_file "$default_cwd_urls_file"
-fi
-if (( ${#urls[@]} <= 1 )); then
   load_urls_from_file "$default_urls_file"
+fi
+
+# Read the login preference once, outside any subshell, so it stays cached.
+if (( login_required_explicit == 0 )); then
+  defaults_login_required >/dev/null 2>&1 || true
 fi
 
 if (( dzi_explicit == 0 )); then
@@ -2127,10 +2283,12 @@ if (( ${#urls[@]} <= 1 )); then
     run_special_site_adapter_if_needed "${urls[1]}"
     code=$?
     if (( code != SPECIAL_RUN_NOT_HANDLED )); then
+      print_failure_reason $code
       exit $code
     fi
 
-    url_effective="$(resolve_special_entry_url "${urls[1]}")"
+    resolve_special_entry_url_cached "${urls[1]}"
+    url_effective="$REPLY"
     if [[ "$url_effective" != "${urls[1]}" ]]; then
       echo "[bookget wrapper] resolved site entry URL: $url_effective" >&2
     fi
@@ -2141,6 +2299,7 @@ if (( ${#urls[@]} <= 1 )); then
       if (( code == 0 )) && [[ "$url_effective" != "${urls[1]}" ]]; then
         echo "[bookget wrapper] done via special-site adapter: ${urls[1]}" >&2
       fi
+      print_failure_reason $code
       exit $code
     fi
 
@@ -2149,7 +2308,9 @@ if (( ${#urls[@]} <= 1 )); then
     else
       run_single_url_with_login_retry "$url_effective" "" "$dzi_choice"
     fi
-    exit $?
+    code=$?
+    print_failure_reason $code
+    exit $code
   fi
   exec "$CORE_BIN" "${filtered_args[@]}"
 fi
@@ -2174,11 +2335,13 @@ for url in "${urls[@]}"; do
     else
       (( fail_count++ ))
       echo "[bookget wrapper] skip after special-site adapter: $url (exit=$code)" >&2
+      print_failure_reason $code "$url"
     fi
     continue
   fi
 
-  url_effective="$(resolve_special_entry_url "$url")"
+  resolve_special_entry_url_cached "$url"
+  url_effective="$REPLY"
   if [[ "$url_effective" != "$url" ]]; then
     echo "[bookget wrapper] resolved site entry URL: $url_effective" >&2
   fi
@@ -2194,6 +2357,7 @@ for url in "${urls[@]}"; do
     else
       (( fail_count++ ))
       echo "[bookget wrapper] skip after special-site adapter: $url (exit=$code)" >&2
+      print_failure_reason $code "$url"
     fi
     continue
   fi
@@ -2210,7 +2374,8 @@ for url in "${urls[@]}"; do
       echo "[bookget wrapper] done: $url" >&2
     else
       (( fail_count++ ))
-      echo "[bookget wrapper] skip after auto fallback: $url" >&2
+      echo "[bookget wrapper] skip after auto fallback: $url (exit=$code)" >&2
+      print_failure_reason $code "$url"
     fi
     continue
   fi
@@ -2218,15 +2383,15 @@ for url in "${urls[@]}"; do
   # Retry once on transient crashes to improve stability.
   attempt=1
   success=0
-    while (( attempt <= 2 )); do
-      run_single_url_with_login_retry "$url_effective" "" "$dzi_choice"
-      code=$?
-      if (( code == 130 )); then
-        exit 130
-      fi
-      if (( code == 0 )); then
-        success=1
-        break
+  while (( attempt <= 2 )); do
+    run_single_url_with_login_retry "$url_effective" "" "$dzi_choice"
+    code=$?
+    if (( code == 130 )); then
+      exit 130
+    fi
+    if (( code == 0 )); then
+      success=1
+      break
     fi
 
     echo "[bookget wrapper] attempt $attempt failed for: $url (exit=$code)" >&2
@@ -2240,7 +2405,8 @@ for url in "${urls[@]}"; do
     echo "[bookget wrapper] done: $url" >&2
   else
     (( fail_count++ ))
-    echo "[bookget wrapper] skip after retries: $url" >&2
+    echo "[bookget wrapper] skip after retries: $url (exit=$code)" >&2
+    print_failure_reason $code "$url"
   fi
 
 done

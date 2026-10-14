@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UserNotifications
 
 private enum BookGetHelpContent {
     static func loadMarkdown() -> String {
@@ -227,6 +228,18 @@ enum QueueTaskState: String {
         case .failed: return "失败"
         }
     }
+
+    var symbol: String {
+        switch self {
+        case .waiting: return "clock"
+        case .running: return "arrow.down.circle"
+        case .retrying: return "arrow.clockwise.circle"
+        case .paused: return "pause.circle"
+        case .stopped: return "stop.circle"
+        case .succeeded: return "checkmark.circle.fill"
+        case .failed: return "xmark.octagon.fill"
+        }
+    }
 }
 
 struct QueueTaskItem: Identifiable {
@@ -437,6 +450,13 @@ final class DownloadEngine {
     private let runLogLock = NSLock()
     private var pendingOutput = Data()
     private let outputLock = NSLock()
+    /// Bumped on every runNext so a stale URL-preparation callback (e.g. from
+    /// before a pause/resume) can never launch a second process.
+    private var launchGeneration = 0
+
+    var isBusy: Bool {
+        state == .running || state == .retrying || state == .paused
+    }
 
     private func markQueueItemsStopped(from startIndex: Int, note: String) {
         guard startIndex >= 0, startIndex < queueItems.count else { return }
@@ -474,7 +494,27 @@ final class DownloadEngine {
     func pause() {
         guard state == .running || state == .retrying else { return }
         isPauseRequested = true
-        terminateProcessTree()
+        if let proc = process, proc.isRunning {
+            terminateProcessTree()
+        } else {
+            // Between tasks (URL preparation, retry hand-off) there is no
+            // process to wait for: pause right away.
+            launchGeneration += 1
+            enterPausedState(index: currentIndex + 1, total: urls.count, status: nil)
+        }
+    }
+
+    private func enterPausedState(index: Int, total: Int, status: Int32?) {
+        state = .paused
+        if currentIndex < queueItems.count {
+            queueItems[currentIndex].state = .paused
+            queueItems[currentIndex].note = "已暂停，可继续"
+        }
+        onQueueUpdated?(queueItems)
+        onState?(.paused, "已暂停。继续时将从当前网址接着下载（已下载的页面会跳过）。")
+        if let status {
+            onTaskFinished?(index, total, status)
+        }
     }
 
     func resume(options: DownloadOptions? = nil) {
@@ -545,11 +585,13 @@ final class DownloadEngine {
         resetRunLog()
 
         let taskArrayIndex = currentIndex
+        launchGeneration += 1
+        let generation = launchGeneration
         prepareURLIfNeeded(for: url) { [weak self] preparedURL, preferredMode in
             guard let self else { return }
             DispatchQueue.main.async {
-                guard self.currentIndex == taskArrayIndex else { return }
-                guard !self.isStopping else { return }
+                guard self.currentIndex == taskArrayIndex, self.launchGeneration == generation else { return }
+                guard !self.isStopping, !self.isPauseRequested else { return }
                 if let preferredMode {
                     self.appModeOverrideByIndex[taskArrayIndex] = preferredMode
                     self.appModeTriedByIndex[taskArrayIndex, default: []].append(preferredMode)
@@ -655,12 +697,20 @@ final class DownloadEngine {
         }
 
         if isPauseRequested {
-            state = .paused
-            queueItems[currentIndex].state = .paused
-            queueItems[currentIndex].note = "已暂停，可继续"
-            onQueueUpdated?(queueItems)
-            onState?(.paused, "已暂停。继续时将从当前网址重新开始。")
-            onTaskFinished?(index, total, status)
+            if status == 0 {
+                // The task finished just before the pause landed: keep it.
+                queueItems[currentIndex].state = .succeeded
+                queueItems[currentIndex].note = "完成"
+                onTaskFinished?(index, total, status)
+                currentIndex += 1
+                if currentIndex >= urls.count {
+                    isPauseRequested = false
+                    state = .running
+                    runNext()
+                    return
+                }
+            }
+            enterPausedState(index: index, total: total, status: status == 0 ? nil : status)
             return
         }
 
@@ -713,7 +763,11 @@ final class DownloadEngine {
 
         failCount += 1
         queueItems[currentIndex].state = .failed
-        queueItems[currentIndex].note = "失败（返回码 \(status)）"
+        if let reason = failureReasonFromLog() {
+            queueItems[currentIndex].note = "失败：\(reason)"
+        } else {
+            queueItems[currentIndex].note = "失败（返回码 \(status)）"
+        }
         onQueueUpdated?(queueItems)
         onTaskFinished?(index, total, status)
         currentIndex += 1
@@ -781,17 +835,41 @@ final class DownloadEngine {
         return text
     }
 
+    /// Prefer the wrapper's explicit summary line, else the last error-looking line.
+    private func failureReasonFromLog() -> String? {
+        let lines = runLogSnapshot()
+            .components(separatedBy: CharacterSet(charactersIn: "\r\n"))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let marker = "失败原因："
+        if let line = lines.last(where: { $0.contains(marker) }),
+           let range = line.range(of: marker) {
+            let reason = line[range.upperBound...].trimmingCharacters(in: .whitespaces)
+            if !reason.isEmpty { return String(reason.prefix(80)) }
+        }
+        let keys = ["error", "failed", "panic", "失败", "错误", "无法"]
+        if let line = lines.last(where: { l in
+            let lower = l.lowercased()
+            return keys.contains(where: { lower.contains($0) })
+        }) {
+            var text = line
+            if text.hasPrefix("[bookget wrapper]") {
+                text = String(text.dropFirst("[bookget wrapper]".count)).trimmingCharacters(in: .whitespaces)
+            }
+            return String(text.prefix(80))
+        }
+        return nil
+    }
+
     private func shouldRetryForNameConflict(at index: Int) -> Bool {
         if conflictRetriedIndexes.contains(index) { return false }
+        // "已存在"/"already exists" usually means the core skipped pages it
+        // already has (e.g. after resume) — retrying into a new folder would
+        // re-download the whole book. The wrapper handles real clashes itself,
+        // so only an explicit name-clash message triggers this.
         let log = runLogSnapshot().lowercased()
-        let keys = ["已存在", "already exists", "file exists", "同名", "重名"]
-        if keys.contains(where: { log.contains($0) }) {
-            return true
-        }
-        if log.contains("download complete"), !log.contains("saved"), !log.contains("下载成功"), !log.contains("/") {
-            return true
-        }
-        return false
+        let skipped = ["跳过", "skip", "已下载"].contains(where: { log.contains($0) })
+        return !skipped && ["同名冲突", "重名"].contains(where: { log.contains($0) })
     }
 
     private func shouldRetryForUnsupportedURL() -> Bool {
@@ -938,10 +1016,7 @@ final class DownloadEngine {
     }
 
     private func makeRetryDirectory(for url: String, index: Int, baseDir: String) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
-        let stamp = formatter.string(from: Date())
+        let stamp = DownloadViewModel.formatDate(Date(), format: "yyyyMMdd_HHmmss")
         let host = (URL(string: url)?.host ?? "task").replacingOccurrences(of: ":", with: "_")
         let name = "bookget_retry_\(index)_\(host)_\(stamp)"
         let dir = URL(fileURLWithPath: baseDir).appendingPathComponent(name, isDirectory: true)
@@ -1000,6 +1075,7 @@ final class DownloadViewModel: ObservableObject {
     private var tempLogURL: URL?
     private var tempLogHandle: FileHandle?
     private var activeQueueRunID: UUID?
+    private var pageProbeTask: Task<Void, Never>?
 
     private let defaults = UserDefaults.standard
     private let kDir = "bookget.last.dir"
@@ -1296,8 +1372,6 @@ final class DownloadViewModel: ObservableObject {
     }
 
     func startDownload() {
-        guard !isRunning, taskState != .paused else { return }
-
         let urls = parseInputURLs(urlText)
         guard !urls.isEmpty else {
             status = "输入错误"
@@ -1309,6 +1383,109 @@ final class DownloadViewModel: ObservableObject {
             detail = "网址格式不正确：\(invalid)"
             return
         }
+        startDownload(urls: urls)
+    }
+
+    /// Re-runs every item that failed in the most recent run.
+    func retryFailedItems() {
+        let failed = queueItems.filter { $0.state == .failed || $0.state == .stopped }.map(\.url)
+        guard !failed.isEmpty else { return }
+        startDownload(urls: failed)
+    }
+
+    func retry(url: String) {
+        startDownload(urls: [url])
+    }
+
+    var canRetryFailed: Bool {
+        !isRunning && taskState != .paused &&
+            queueItems.contains { $0.state == .failed || $0.state == .stopped }
+    }
+
+    func clearQueueHistory() {
+        guard !isRunning, taskState != .paused else { return }
+        queueRuns = []
+        queueItems = []
+        activeQueueRunID = nil
+        checkpointText = ""
+    }
+
+    func clearLogDisplay() {
+        logEntries = []
+    }
+
+    func copyLogToPasteboard() {
+        let text = logEntries.map(\.text).joined(separator: "\n")
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        detail = "日志已复制到剪贴板。"
+    }
+
+    /// Number of distinct links currently in the input box.
+    var inputURLCount: Int {
+        parseInputURLs(urlText).filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }.count
+    }
+
+    func pasteURLsFromClipboard() {
+        guard let text = NSPasteboard.general.string(forType: .string) else { return }
+        appendURLs(Self.extractURLs(from: text))
+    }
+
+    /// Accepts .webloc (Safari/Finder), .url (Windows) and plain-text lists.
+    func handleDroppedFiles(_ files: [URL]) {
+        var found: [String] = []
+        for file in files {
+            switch file.pathExtension.lowercased() {
+            case "webloc":
+                if let data = try? Data(contentsOf: file),
+                   let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                   let url = plist["URL"] as? String {
+                    found.append(url)
+                }
+            default:
+                if let text = try? String(contentsOf: file, encoding: .utf8) {
+                    found += Self.extractURLs(from: text)
+                }
+            }
+        }
+        appendURLs(found)
+    }
+
+    private func appendURLs(_ urls: [String]) {
+        guard !urls.isEmpty else {
+            detail = "没有找到可用的网址。"
+            return
+        }
+        let existing = Set(parseInputURLs(urlText))
+        var seen = existing
+        let fresh = urls.filter { seen.insert($0).inserted }
+        guard !fresh.isEmpty else {
+            detail = "这些网址已经在列表里了。"
+            return
+        }
+        var text = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { text += "\n" }
+        urlText = text + fresh.joined(separator: "\n")
+        detail = "已添加 \(fresh.count) 个网址。"
+    }
+
+    // A link ends at whitespace, quotes/brackets, or CJK punctuation that is
+    // often typed right after it (见 https://…，以及 …).
+    private static let urlRegex = try! NSRegularExpression(
+        pattern: #"https?://[^\s<>"'，。、；：！？（）《》「」【】]+"#,
+        options: [.caseInsensitive]
+    )
+
+    static func extractURLs(from text: String) -> [String] {
+        let ns = text as NSString
+        return urlRegex.matches(in: text, range: NSRange(location: 0, length: ns.length)).map {
+            ns.substring(with: $0.range).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:)]"))
+        }
+    }
+
+    func startDownload(urls: [String]) {
+        guard !isRunning, taskState != .paused else { return }
 
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: saveDirectory, isDirectory: &isDir), isDir.boolValue else {
@@ -1364,6 +1541,9 @@ final class DownloadViewModel: ObservableObject {
             items: urls.map { QueueTaskItem(url: $0, state: .waiting, note: "等待中") }
         )
         queueRuns.append(run)
+        if queueRuns.count > 30 {
+            queueRuns.removeFirst(queueRuns.count - 30)
+        }
         activeQueueRunID = run.id
         queueItems = run.items
         checkpointText = ""
@@ -1419,6 +1599,7 @@ final class DownloadViewModel: ObservableObject {
             guard let self else { return }
             DispatchQueue.main.async {
                 self.queueItems = items
+                self.updateDockBadge()
                 if let activeID = self.activeQueueRunID,
                    let idx = self.queueRuns.firstIndex(where: { $0.id == activeID }) {
                     self.queueRuns[idx].items = items
@@ -1466,11 +1647,50 @@ final class DownloadViewModel: ObservableObject {
             self?.enqueueLogChunkForUI(chunk)
         }
 
-        engine.onFinished = { [weak self] _ in
+        engine.onFinished = { [weak self] failCount in
             guard let self else { return }
             DispatchQueue.main.async {
                 self.flushPendingLogNow()
+                NSApp.dockTile.badgeLabel = nil
+                self.notifyFinished(failCount: failCount)
             }
+        }
+    }
+
+    private func updateDockBadge() {
+        let remaining = queueItems.filter { [.waiting, .running, .retrying].contains($0.state) }.count
+        NSApp.dockTile.badgeLabel = remaining > 0 ? "\(remaining)" : nil
+    }
+
+    private func notifyFinished(failCount: Int) {
+        let total = queueItems.count
+        let succeeded = queueItems.filter { $0.state == .succeeded }.count
+        let wasStopped = taskState == .stopped
+        let title: String
+        let body: String
+        if wasStopped {
+            title = "下载已终止"
+            body = "已完成 \(succeeded) / \(total) 个网址。"
+        } else if failCount == 0 {
+            title = "下载完成"
+            body = total > 1 ? "\(total) 个网址全部下载完成。" : "网址已下载完成。"
+        } else {
+            title = "下载结束，有 \(failCount) 个失败"
+            body = "成功 \(succeeded) / \(total)。可在任务队列中点「重试失败项」。"
+        }
+        if !NSApp.isActive {
+            NSApp.requestUserAttention(.informationalRequest)
+        }
+        // UNUserNotificationCenter traps without a bundle identifier.
+        guard !wasStopped, Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
         }
     }
 
@@ -1522,8 +1742,11 @@ final class DownloadViewModel: ObservableObject {
 
         appendChunkToTempLog(chunk)
 
-        DispatchQueue.main.async {
-            let lines = chunk.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        // Callers are on the main thread; applying synchronously keeps the log
+        // ahead of the "finished" state that is set right after a flush.
+        let apply = {
+            var lines = chunk.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            if lines.last == "" { lines.removeLast() }
             for line in lines {
                 self.logEntryCounter += 1
                 self.logEntries.append(LogEntry(id: self.logEntryCounter, text: line))
@@ -1533,6 +1756,7 @@ final class DownloadViewModel: ObservableObject {
             }
             self.consumeLogChunk(chunk)
         }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }
 
     private func setupTempLog() -> Bool {
@@ -1578,17 +1802,23 @@ final class DownloadViewModel: ObservableObject {
         }
     }
 
+    /// One link per line (several per line separated by spaces also work);
+    /// duplicates are dropped so a book is never downloaded twice in a run.
     private func parseInputURLs(_ raw: String) -> [String] {
-        raw
-            .split(whereSeparator: \.isNewline)
+        var seen = Set<String>()
+        return raw
+            .components(separatedBy: CharacterSet.whitespacesAndNewlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
     private func discoverTotalPages(for sourceURL: String) {
         detectedTotalText = "正在探测总页数..."
-        Task {
+        // A slow probe for the previous book must not set this book's total.
+        pageProbeTask?.cancel()
+        pageProbeTask = Task {
             let total = await Self.detectTotalPages(from: sourceURL)
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 if let total, total > 0 {
                     self.totalCount = max(self.totalCount, total)
@@ -1641,10 +1871,10 @@ final class DownloadViewModel: ObservableObject {
             candidates.append(fallback)
         }
 
-        var dedup: [String: URL] = [:]
-        for c in candidates { dedup[c.absoluteString] = c }
+        var seen = Set<String>()
+        let ordered = candidates.filter { seen.insert($0.absoluteString).inserted }
 
-        for (_, url) in dedup {
+        for url in ordered {
             if let total = await fetchManifestTotal(from: url) {
                 return total
             }
@@ -1653,41 +1883,50 @@ final class DownloadViewModel: ObservableObject {
         return nil
     }
 
-    private static func fetchManifestTotal(from manifestURL: URL) async -> Int? {
-        guard let data = await fetchData(from: manifestURL, maxBytes: 4_000_000) else { return nil }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return nil }
-
-        let total = countCanvasNodes(in: obj)
-        if total > 0 { return total }
-
+    static func manifestPageCount(from obj: Any) -> Int? {
         if let dict = obj as? [String: Any] {
+            // IIIF v2: the page list is sequences[0].canvases.
             if let seqs = dict["sequences"] as? [[String: Any]],
                let canvases = seqs.first?["canvases"] as? [Any], !canvases.isEmpty {
                 return canvases.count
             }
-            if let items = dict["items"] as? [Any], !items.isEmpty {
-                return items.count
+            // IIIF v3: top-level items are the canvases; "structures" only
+            // references them again, so it must not be counted.
+            if let items = dict["items"] as? [[String: Any]], !items.isEmpty {
+                let canvases = items.filter { ($0["type"] as? String)?.caseInsensitiveCompare("Canvas") == .orderedSame }
+                return canvases.isEmpty ? items.count : canvases.count
             }
         }
-
-        return nil
+        // Unknown layout: count distinct canvas ids anywhere in the document.
+        var ids = Set<String>()
+        var anonymous = 0
+        collectCanvasIDs(in: obj, ids: &ids, anonymous: &anonymous)
+        let total = ids.count + anonymous
+        return total > 0 ? total : nil
     }
 
-    private static func countCanvasNodes(in obj: Any) -> Int {
+    private static func fetchManifestTotal(from manifestURL: URL) async -> Int? {
+        guard let data = await fetchData(from: manifestURL, maxBytes: 4_000_000) else { return nil }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return manifestPageCount(from: obj)
+    }
+
+    private static func collectCanvasIDs(in obj: Any, ids: inout Set<String>, anonymous: inout Int) {
         if let dict = obj as? [String: Any] {
-            var c = 0
-            if let t = dict["type"] as? String, t.caseInsensitiveCompare("Canvas") == .orderedSame {
-                c += 1
+            let type = (dict["type"] as? String) ?? (dict["@type"] as? String) ?? ""
+            if type.caseInsensitiveCompare("Canvas") == .orderedSame || type.caseInsensitiveCompare("sc:Canvas") == .orderedSame {
+                if let id = (dict["id"] as? String) ?? (dict["@id"] as? String) {
+                    ids.insert(id)
+                } else {
+                    anonymous += 1
+                }
             }
             for (_, v) in dict {
-                c += countCanvasNodes(in: v)
+                collectCanvasIDs(in: v, ids: &ids, anonymous: &anonymous)
             }
-            return c
+        } else if let arr = obj as? [Any] {
+            for v in arr { collectCanvasIDs(in: v, ids: &ids, anonymous: &anonymous) }
         }
-        if let arr = obj as? [Any] {
-            return arr.reduce(0) { $0 + countCanvasNodes(in: $1) }
-        }
-        return 0
     }
 
     private static func fetchText(from url: URL, maxBytes: Int) async -> String? {
@@ -1861,17 +2100,16 @@ final class DownloadViewModel: ObservableObject {
         progressText = "\(percent)%（\(downloadedCount)/\(totalCount)）"
     }
 
-	private func extractPair(from line: String) -> (Int, Int)? {
-		// Restrict parsing to explicit progress-like lines to avoid false positives
-		// from generic "x/y" text fragments.
-		let patterns = [
-			"(?i)(?:^|\\s)get\\s*(\\d+)\\s*/\\s*(\\d+)(?:\\s|$)",
-			"(?i)(?:^|\\s)saved\\s*(\\d+)\\s*/\\s*(\\d+)(?:\\s|$)",
-			"第\\s*(\\d+)\\s*[\\/／]\\s*(\\d+)\\s*(?:页|張|张|項|项)"
-		]
+	// Restrict parsing to explicit progress-like lines to avoid false positives
+	// from generic "x/y" text fragments. Compiled once, not per log line.
+	private static let progressRegexes: [NSRegularExpression] = [
+		"(?i)(?:^|\\s)get\\s*(\\d+)\\s*/\\s*(\\d+)(?:\\s|$)",
+		"(?i)(?:^|\\s)saved\\s*(\\d+)\\s*/\\s*(\\d+)(?:\\s|$)",
+		"第\\s*(\\d+)\\s*[\\/／]\\s*(\\d+)\\s*(?:页|張|张|項|项)"
+	].compactMap { try? NSRegularExpression(pattern: $0) }
 
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+	private func extractPair(from line: String) -> (Int, Int)? {
+        for regex in Self.progressRegexes {
             let ns = line as NSString
             let range = NSRange(location: 0, length: ns.length)
             guard let match = regex.firstMatch(in: line, options: [], range: range), match.numberOfRanges >= 3 else { continue }
@@ -1884,10 +2122,19 @@ final class DownloadViewModel: ObservableObject {
         return nil
     }
 
-    private static func formatDate(_ date: Date, format: String) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = format
+    private static var formatters: [String: DateFormatter] = [:]
+    private static let formattersLock = NSLock()
+
+    static func formatDate(_ date: Date, format: String) -> String {
+        formattersLock.lock()
+        defer { formattersLock.unlock() }
+        let formatter = formatters[format] ?? {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "zh_CN")
+            f.dateFormat = format
+            formatters[format] = f
+            return f
+        }()
         return formatter.string(from: date)
     }
 }
@@ -1898,6 +2145,7 @@ struct Card<Content: View>: View {
     let style: CardVisualStyle
     let primaryText: Color
     let secondaryText: Color
+    let accessory: AnyView?
     let content: Content
 
     init(
@@ -1906,6 +2154,7 @@ struct Card<Content: View>: View {
         style: CardVisualStyle = .frosted,
         primaryText: Color = .primary,
         secondaryText: Color = .secondary,
+        accessory: AnyView? = nil,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
@@ -1913,22 +2162,32 @@ struct Card<Content: View>: View {
         self.style = style
         self.primaryText = primaryText
         self.secondaryText = secondaryText
+        self.accessory = accessory
         self.content = content()
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(primaryText)
-            if let subtitle {
-                Text(subtitle)
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(secondaryText)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(primaryText)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(secondaryText)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                if let accessory {
+                    accessory
+                        .controlSize(.small)
+                }
             }
             content
         }
         .padding(12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(cardBackground)
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -2069,13 +2328,9 @@ struct WindowSizeEnforcer: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            if let window = nsView.window {
-                applyConstraints(to: window)
-            }
-        }
-    }
+    // Constraints are applied once when the window attaches; re-applying on
+    // every SwiftUI update (e.g. each log flush) only caused window churn.
+    func updateNSView(_ nsView: NSView, context: Context) {}
 
     private func applyConstraints(to window: NSWindow) {
         let minSize = NSSize(width: minWidth, height: minHeight)
@@ -2095,6 +2350,81 @@ final class WindowHookView: NSView {
         super.viewDidMoveToWindow()
         if let window {
             onWindowAttached?(window)
+        }
+    }
+}
+
+/// NSTextView-backed input so that dropped .webloc/.txt files are read as
+/// link lists instead of having their file paths pasted in as text.
+final class URLDropTextView: NSTextView {
+    var onFilesDropped: (([URL]) -> Void)?
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        if let files = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL],
+           !files.isEmpty {
+            onFilesDropped?(files)
+            return true
+        }
+        return super.performDragOperation(sender)
+    }
+}
+
+struct URLInputEditor: NSViewRepresentable {
+    @Binding var text: String
+    let textColor: NSColor
+    let onFilesDropped: ([URL]) -> Void
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: URLInputEditor
+        init(_ parent: URLInputEditor) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            parent.text = tv.string
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        let textView = URLDropTextView()
+        textView.delegate = context.coordinator
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.drawsBackground = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textColor = textColor
+        textView.insertionPointColor = textColor
+        textView.textContainerInset = NSSize(width: 4, height: 6)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.registerForDraggedTypes([.fileURL, .URL, .string])
+        textView.onFilesDropped = onFilesDropped
+        textView.string = text
+        scroll.documentView = textView
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        return scroll
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let tv = nsView.documentView as? URLDropTextView else { return }
+        tv.onFilesDropped = onFilesDropped
+        tv.textColor = textColor
+        tv.insertionPointColor = textColor
+        if tv.string != text {
+            tv.string = text
         }
     }
 }
@@ -2149,25 +2479,48 @@ struct LogConsoleView: NSViewRepresentable {
         }
 
         let newestID = entries.last?.id ?? 0
-        if newestID < context.coordinator.lastRenderedID {
+        // lastRenderedID == 0 means the placeholder is showing: replace it.
+        if newestID < context.coordinator.lastRenderedID || context.coordinator.lastRenderedID == 0 {
             context.coordinator.lastRenderedID = 0
             textView.string = ""
         }
 
         let delta = entries.filter { $0.id > context.coordinator.lastRenderedID }
-        if !delta.isEmpty {
-            let chunk = delta.map(\.text).joined(separator: "\n") + "\n"
-            textView.textStorage?.append(NSAttributedString(string: chunk, attributes: attrs))
-            context.coordinator.lastRenderedID = newestID
+        guard !delta.isEmpty, let storage = textView.textStorage else { return }
 
-            if textView.string.count > 140_000 {
-                let trimmed = String(textView.string.suffix(120_000))
-                textView.textStorage?.setAttributedString(
-                    NSAttributedString(string: trimmed, attributes: attrs)
-                )
-            }
+        // Only follow the output when the user hasn't scrolled up to read.
+        let clip = nsView.contentView
+        let wasAtBottom = clip.bounds.maxY >= (textView.frame.height - 24)
+
+        let chunk = NSMutableAttributedString()
+        for entry in delta {
+            chunk.append(NSAttributedString(string: entry.text + "\n", attributes: attributes(for: entry.text, base: attrs)))
+        }
+        storage.append(chunk)
+        context.coordinator.lastRenderedID = newestID
+
+        // NSTextStorage.length is O(1); String.count would walk the whole log.
+        if storage.length > 140_000 {
+            let cut = storage.length - 120_000
+            let ns = storage.string as NSString
+            let lineEnd = ns.range(of: "\n", options: [], range: NSRange(location: cut, length: ns.length - cut))
+            let removeUpTo = lineEnd.location == NSNotFound ? cut : lineEnd.location + 1
+            storage.deleteCharacters(in: NSRange(location: 0, length: removeUpTo))
+        }
+        if wasAtBottom {
             scrollToBottom(textView)
         }
+    }
+
+    private func attributes(for line: String, base: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        var attrs = base
+        let lower = line.lowercased()
+        if lower.contains("失败") || lower.contains("error") || lower.contains("panic") || lower.contains("错误") {
+            attrs[.foregroundColor] = NSColor.systemRed.blended(withFraction: 0.25, of: textColor) ?? NSColor.systemRed
+        } else if line.hasPrefix("[bookget wrapper]") || line.hasPrefix("[bookget gui]") {
+            attrs[.foregroundColor] = textColor.withAlphaComponent(0.62)
+        }
+        return attrs
     }
 
     private func textAttributes() -> [NSAttributedString.Key: Any] {
@@ -2496,584 +2849,824 @@ struct ContentView: View {
         }
     }
 
+    private var statusPillColor: Color {
+        switch vm.taskState {
+        case .running, .retrying: return .orange
+        case .paused: return .yellow
+        case .failed: return .red
+        case .completed: return .green
+        default: return vm.isRunning ? .orange : .green
+        }
+    }
+
+    private var statusPillText: String {
+        switch vm.taskState {
+        case .running: return "下载中"
+        case .retrying: return "重试中"
+        case .paused: return "已暂停"
+        case .failed: return "部分失败"
+        case .completed: return "已完成"
+        case .stopped: return "已终止"
+        case .idle: return "空闲"
+        }
+    }
+
+    private var isBusy: Bool { vm.isRunning || vm.taskState == .paused }
+
+    private func fieldLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(cardSecondaryText)
+            .gridColumnAlignment(.leading)
+    }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "book.closed.fill")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(headerPrimary)
+                .frame(width: 36, height: 36)
+                .background(
+                    LinearGradient(
+                        colors: [accentTint.opacity(0.55), Color.white.opacity(0.22)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("BookGet GUI")
+                    .font(.system(size: 19, weight: .bold))
+                    .foregroundStyle(headerPrimary)
+                Text("典籍下载工作台")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(headerPrimary.opacity(0.72))
+            }
+
+            Spacer()
+
+            Label(statusPillText, systemImage: "circle.fill")
+                .labelStyle(StatusDotLabelStyle(color: statusPillColor))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(headerPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(statusPillColor.opacity(0.18), in: Capsule())
+
+            Button {
+                clearInputFocus()
+                showSitesInfo = true
+            } label: {
+                Label("支持网站", systemImage: "globe")
+            }
+            .help("查看可下载的图书馆与网站")
+
+            Menu {
+                Picker("配色", selection: $themeRaw) {
+                    ForEach(AppTheme.allCases) { t in
+                        Text(t.title).tag(t.rawValue)
+                    }
+                }
+                .pickerStyle(.inline)
+                Divider()
+                Picker("卡片样式", selection: $cardStyleRaw) {
+                    ForEach(CardVisualStyle.allCases) { s in
+                        Text(s.title).tag(s.rawValue)
+                    }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label("外观", systemImage: "paintpalette")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("配色与卡片样式")
+
+            Menu {
+                Button("恢复上次设置") {
+                    clearInputFocus()
+                    vm.restoreLastUsed()
+                }
+                Button("清空最近记录") {
+                    clearInputFocus()
+                    vm.clearRecentHistory()
+                }
+                Divider()
+                Button("恢复初始设置…") {
+                    clearInputFocus()
+                    showRestoreFactoryDefaultsConfirm = true
+                }
+                .disabled(isBusy)
+                Divider()
+                Button("BookGet GUI 帮助") {
+                    BookGetHelpWindowController.shared.show()
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("更多")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(topBarBackground)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(topBarBorder, lineWidth: 1)
+        )
+    }
+
+    // MARK: Left column
+
+    private var inputCard: some View {
+        Card("下载内容", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
+                GridRow(alignment: .top) {
+                    fieldLabel("网址")
+                        .padding(.top, 7)
+                    VStack(alignment: .leading, spacing: 6) {
+                        ZStack(alignment: .topLeading) {
+                            URLInputEditor(
+                                text: $vm.urlText,
+                                textColor: NSColor(cardPrimaryText),
+                                onFilesDropped: { vm.handleDroppedFiles($0) }
+                            )
+                            if vm.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("每行一个网址，可一次粘贴多行\n也可以把网页链接、.webloc 或 .txt 文件拖到这里")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(cardSecondaryText.opacity(0.85))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 6)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .frame(minHeight: 96, idealHeight: 120, maxHeight: 160)
+                        .background(urlEditorBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(urlEditorBorder, lineWidth: 1)
+                        )
+
+                        HStack(spacing: 8) {
+                            let count = vm.inputURLCount
+                            Text(count == 0 ? "尚未输入网址" : "已识别 \(count) 个网址")
+                                .font(.system(size: 11))
+                                .foregroundStyle(cardSecondaryText)
+                            Spacer(minLength: 0)
+                            Button {
+                                vm.pasteURLsFromClipboard()
+                            } label: {
+                                Label("粘贴", systemImage: "doc.on.clipboard")
+                            }
+                            Menu {
+                                if vm.recentUrls.isEmpty {
+                                    Text("暂无记录")
+                                } else {
+                                    ForEach(vm.recentUrls, id: \.self) { u in
+                                        Button(u) { vm.applyRecentURL(u) }
+                                    }
+                                }
+                            } label: {
+                                Label("最近", systemImage: "clock.arrow.circlepath")
+                            }
+                            .fixedSize()
+                            Button {
+                                vm.urlText = ""
+                            } label: {
+                                Label("清空", systemImage: "xmark.circle")
+                            }
+                            .disabled(vm.urlText.isEmpty)
+                        }
+                        .controlSize(.small)
+                        .disabled(isBusy)
+                    }
+                }
+
+                GridRow {
+                    fieldLabel("保存到")
+                    HStack(spacing: 6) {
+                        TextField("选择保存目录", text: $vm.saveDirectory)
+                            .focused($focusedField, equals: .saveDirectory)
+                            .textFieldStyle(.roundedBorder)
+                            .restoreArrowCursorOnExit()
+                        Button("选择…") {
+                            clearInputFocus()
+                            vm.chooseDirectory()
+                        }
+                        Menu {
+                            if vm.recentDirectories.isEmpty {
+                                Text("暂无记录")
+                            } else {
+                                ForEach(vm.recentDirectories, id: \.self) { d in
+                                    Button(d) { vm.applyRecentDirectory(d) }
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "clock.arrow.circlepath")
+                        }
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("最近使用的目录")
+                    }
+                }
+
+                GridRow {
+                    fieldLabel("验证")
+                    Toggle(isOn: Binding(
+                        get: { vm.needLogin },
+                        set: { vm.applyNeedLogin($0) }
+                    )) {
+                        Text("开启弹窗浏览器（需要登录或验证的网站）")
+                            .foregroundStyle(cardPrimaryText)
+                    }
+                    .help("上海图书馆、台北国图等需要登录或点开阅读页的网站请保持开启")
+                }
+            }
+        }
+    }
+
+    private func advancedField(_ label: String, hint: String, text: Binding<String>, focus: InputFocusField) -> some View {
+        GridRow {
+            fieldLabel(label)
+            TextField(hint, text: text)
+                .focused($focusedField, equals: focus)
+                .textFieldStyle(.roundedBorder)
+                .restoreArrowCursorOnExit()
+        }
+    }
+
+    private var advancedCard: some View {
+        Card(
+            "高级参数",
+            subtitle: vm.showAdvanced ? nil : "默认设置适合大多数网站",
+            style: cardStyle,
+            primaryText: cardPrimaryText,
+            secondaryText: cardSecondaryText,
+            accessory: AnyView(
+                Toggle("启用", isOn: $vm.showAdvanced)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .help("启用后以下参数才会生效")
+            )
+        ) {
+            if vm.showAdvanced {
+                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                    GridRow {
+                        fieldLabel("识别模式")
+                        Picker("", selection: $vm.appMode) {
+                            Text("0 · 内置站点规则（默认）").tag("0")
+                            Text("1 · 通用批量抓取").tag("1")
+                            Text("2 · IIIF 自动识别").tag("2")
+                        }
+                        .labelsHidden()
+                        .onChange(of: vm.appMode) { _, newValue in
+                            vm.applyAppMode(newValue)
+                        }
+                    }
+                    advancedField("并发线程", hint: "2（建议 2–6）", text: $vm.concurrency, focus: .concurrency)
+                    advancedField("失败重试", hint: "3", text: $vm.retries, focus: .retries)
+                    advancedField("抓取间隔", hint: "秒，留空为不限", text: $vm.captureInterval, focus: .captureInterval)
+                    advancedField("页码范围", hint: "如 4:50", text: $vm.seq, focus: .seq)
+                    advancedField("分册范围", hint: "如 3:6", text: $vm.vol, focus: .vol)
+                    GridRow {
+                        fieldLabel("输出格式")
+                        Picker("", selection: $vm.fileExt) {
+                            Text("默认").tag("_")
+                            Text(".jpg").tag(".jpg")
+                            Text(".png").tag(".png")
+                            Text(".tif").tag(".tif")
+                            Text(".pdf").tag(".pdf")
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    GridRow {
+                        fieldLabel("浏览器标识")
+                        HStack(spacing: 6) {
+                            Picker("", selection: $vm.uaPreset) {
+                                ForEach(UserAgentPreset.allCases) { preset in
+                                    Text(preset.title).tag(preset.rawValue)
+                                }
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                            .onChange(of: vm.uaPreset) { _, newValue in
+                                vm.applyUAPreset(newValue)
+                            }
+                            if vm.uaPreset == UserAgentPreset.custom.rawValue {
+                                TextField("粘贴自定义 User-Agent", text: $vm.userAgent)
+                                    .focused($focusedField, equals: .userAgent)
+                                    .textFieldStyle(.roundedBorder)
+                                    .restoreArrowCursorOnExit()
+                                    .onChange(of: vm.userAgent) { _, newValue in
+                                        vm.updateCustomUserAgent(newValue)
+                                    }
+                            }
+                        }
+                    }
+                    GridRow {
+                        fieldLabel("Cookie 文件")
+                        HStack(spacing: 6) {
+                            TextField("可选：cookie.txt", text: $vm.cookieFilePath)
+                                .focused($focusedField, equals: .cookieFilePath)
+                                .textFieldStyle(.roundedBorder)
+                                .restoreArrowCursorOnExit()
+                            Button("选择…") {
+                                clearInputFocus()
+                                vm.chooseCookieFile()
+                            }
+                            Button {
+                                clearInputFocus()
+                                vm.clearCookieFile()
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .help("清空")
+                            .disabled(vm.cookieFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                    GridRow {
+                        fieldLabel("localStorage")
+                        HStack(spacing: 6) {
+                            TextField("可选：localStorage.txt", text: $vm.localStorageFilePath)
+                                .focused($focusedField, equals: .localStorageFilePath)
+                                .textFieldStyle(.roundedBorder)
+                                .restoreArrowCursorOnExit()
+                            Button("选择…") {
+                                clearInputFocus()
+                                vm.chooseLocalStorageFile()
+                            }
+                            Button {
+                                clearInputFocus()
+                                vm.clearLocalStorageFile()
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .help("清空")
+                            .disabled(vm.localStorageFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                }
+                .disabled(isBusy)
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: vm.showAdvanced)
+    }
+
+    private var tipsCard: some View {
+        Card("小提示", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
+            VStack(alignment: .leading, spacing: 7) {
+                tip("square.stack.3d.down.right", "一次可粘贴多个网址，重复的会自动去掉。")
+                tip("person.badge.key", "上海图书馆、台北国图等需要登录的网站，请勾选「开启弹窗浏览器」。")
+                tip("pause.circle", "暂停或终止后再下载同一网址，已下好的页面会自动跳过。")
+                tip("arrow.clockwise", "失败的网址可在任务队列里一键「重试失败项」，右键单项可复制或重下。")
+            }
+        }
+    }
+
+    private func tip(_ symbol: String, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: symbol)
+                .foregroundStyle(accentTint)
+                .frame(width: 16)
+            Text(text)
+                .font(.system(size: 12))
+                .foregroundStyle(cardSecondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Only the buttons that make sense right now, so none sit there disabled.
+    private var actionBar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                switch vm.taskState {
+                case .running, .retrying:
+                    Button {
+                        clearInputFocus()
+                        vm.pauseDownload()
+                    } label: {
+                        Label("暂停", systemImage: "pause.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut("p", modifiers: .command)
+                    stopButton
+                case .paused:
+                    Button {
+                        clearInputFocus()
+                        vm.resumeDownload()
+                    } label: {
+                        Label("继续下载", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut("p", modifiers: .command)
+                    stopButton
+                default:
+                    Button {
+                        clearInputFocus()
+                        vm.startDownload()
+                    } label: {
+                        Label("开始下载", systemImage: "arrow.down.circle.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(vm.inputURLCount == 0)
+                }
+            }
+            .controlSize(.large)
+            .onHover { inside in if inside { forceArrowCursor() } }
+
+            Text(actionHint)
+                .font(.system(size: 11))
+                .foregroundStyle(cardSecondaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(12)
+        .background(urlEditorBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(urlEditorBorder, lineWidth: 1)
+        )
+    }
+
+    private var stopButton: some View {
+        Button(role: .destructive) {
+            clearInputFocus()
+            vm.stopDownload()
+        } label: {
+            Label("终止", systemImage: "stop.fill").frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .keyboardShortcut(".", modifiers: .command)
+    }
+
+    private var actionHint: String {
+        switch vm.taskState {
+        case .running, .retrying:
+            return "⌘P 暂停 · ⌘. 终止 · 已下载的页面在继续时会自动跳过"
+        case .paused:
+            return "⌘P 继续 · ⌘. 终止"
+        default:
+            let count = vm.inputURLCount
+            let dir = (vm.saveDirectory as NSString).abbreviatingWithTildeInPath
+            return count == 0 ? "⌘↩ 开始下载" : "⌘↩ 下载 \(count) 个网址到 \(dir)"
+        }
+    }
+
+    // MARK: Right column
+
+    private var statusCard: some View {
+        Card(
+            "任务状态",
+            style: cardStyle,
+            primaryText: cardPrimaryText,
+            secondaryText: cardSecondaryText,
+            accessory: AnyView(
+                HStack(spacing: 6) {
+                    Button {
+                        clearInputFocus()
+                        vm.exportTaskLog()
+                    } label: {
+                        Label("导出日志", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(vm.isRunning || vm.logEntries.isEmpty)
+                    Button {
+                        clearInputFocus()
+                        vm.openSaveDirectory()
+                    } label: {
+                        Label("打开目录", systemImage: "folder")
+                    }
+                }
+            )
+        ) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(vm.status)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(cardPrimaryText)
+                    Spacer(minLength: 8)
+                    if vm.isRunning || vm.hasProgressEstimate {
+                        Text(vm.progressText)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(cardSecondaryText)
+                    }
+                }
+
+                if vm.hasProgressEstimate {
+                    ProgressView(value: vm.progressValue)
+                        .progressViewStyle(.linear)
+                        .tint(accentTint)
+                } else if vm.isRunning {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                        .tint(accentTint)
+                }
+
+                Text(vm.detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(cardSecondaryText)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+
+                if !vm.detectedTotalText.isEmpty || !vm.checkpointText.isEmpty {
+                    HStack(spacing: 10) {
+                        if !vm.detectedTotalText.isEmpty {
+                            Text(vm.detectedTotalText)
+                        }
+                        if !vm.checkpointText.isEmpty {
+                            Text(vm.checkpointText)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(cardSecondaryText)
+                }
+
+                if !vm.exportedLogPath.isEmpty {
+                    Text(vm.exportedLogPath)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(cardSecondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private func queueRow(index: Int, item: QueueTaskItem) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: item.state.symbol)
+                .foregroundStyle(queueStateColor(item.state))
+                .frame(width: 16)
+            Text("\(index + 1).")
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(cardSecondaryText)
+                .frame(width: 24, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.url)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(cardPrimaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if item.state == .failed || item.state == .retrying,
+                   !item.note.isEmpty {
+                    Text(item.note)
+                        .font(.system(size: 10))
+                        .foregroundStyle(queueStateColor(item.state).opacity(0.9))
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            Text(item.state.title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(queueStateColor(item.state))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(queueStateColor(item.state).opacity(0.16), in: Capsule())
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .help(item.note.isEmpty ? item.url : "\(item.url)\n\(item.note)")
+        .contextMenu {
+            Button("复制网址") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(item.url, forType: .string)
+            }
+            if let u = URL(string: item.url) {
+                Button("在浏览器中打开") { NSWorkspace.shared.open(u) }
+            }
+            Divider()
+            Button("重新下载这一项") { vm.retry(url: item.url) }
+                .disabled(isBusy)
+        }
+    }
+
+    private var queueCard: some View {
+        Card(
+            "任务队列",
+            style: cardStyle,
+            primaryText: cardPrimaryText,
+            secondaryText: cardSecondaryText,
+            accessory: AnyView(
+                HStack(spacing: 6) {
+                    Button {
+                        vm.retryFailedItems()
+                    } label: {
+                        Label("重试失败项", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(!vm.canRetryFailed)
+                    Button {
+                        vm.clearQueueHistory()
+                    } label: {
+                        Label("清空", systemImage: "trash")
+                    }
+                    .disabled(isBusy || vm.queueRuns.isEmpty)
+                }
+            )
+        ) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Text("共 \(queueSummary.total)")
+                        .foregroundStyle(cardSecondaryText)
+                    Text("完成 \(queueSummary.done)")
+                        .foregroundStyle(Color.green.opacity(0.95))
+                    Text("失败 \(queueSummary.failed)")
+                        .foregroundStyle(Color.red.opacity(0.95))
+                    Text("终止 \(queueSummary.stopped)")
+                        .foregroundStyle(cardSecondaryText)
+                    Spacer(minLength: 0)
+                    if vm.queueRuns.count > 1 {
+                        Text("历史 \(vm.queueRuns.count) 批")
+                            .foregroundStyle(cardSecondaryText)
+                    }
+                }
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            if vm.queueRuns.isEmpty {
+                                Text("还没有任务。输入网址后点「开始下载」。")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(cardSecondaryText)
+                                    .padding(.vertical, 6)
+                            } else {
+                                ForEach(Array(vm.queueRuns.enumerated()), id: \.element.id) { runIdx, run in
+                                    HStack {
+                                        Text("第 \(runIdx + 1) 批")
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundStyle(cardPrimaryText)
+                                        Text(run.startedAtText)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundStyle(cardSecondaryText)
+                                        Spacer(minLength: 0)
+                                    }
+                                    .padding(.top, runIdx == 0 ? 0 : 6)
+                                    .id(run.id)
+
+                                    ForEach(Array(run.items.enumerated()), id: \.element.id) { idx, item in
+                                        queueRow(index: idx, item: item)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(10)
+                    }
+                    .onChange(of: vm.queueRuns.last?.id) { _, newID in
+                        if let newID {
+                            withAnimation { proxy.scrollTo(newID, anchor: .top) }
+                        }
+                    }
+                }
+                .frame(height: vm.queueRuns.isEmpty ? 64 : 168)
+                .background(Color.black.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+    }
+
+    private var logCard: some View {
+        Card(
+            "实时日志",
+            style: cardStyle,
+            primaryText: cardPrimaryText,
+            secondaryText: cardSecondaryText,
+            accessory: AnyView(
+                HStack(spacing: 6) {
+                    Button {
+                        vm.copyLogToPasteboard()
+                    } label: {
+                        Label("复制", systemImage: "doc.on.doc")
+                    }
+                    .disabled(vm.logEntries.isEmpty)
+                    Button {
+                        vm.clearLogDisplay()
+                    } label: {
+                        Label("清屏", systemImage: "eraser")
+                    }
+                    .disabled(vm.logEntries.isEmpty)
+                    .help("只清空显示，导出的日志仍然完整")
+                }
+            )
+        ) {
+            LogConsoleView(entries: vm.logEntries, textColor: logTextNSColor)
+                .frame(minHeight: 220, maxHeight: .infinity)
+                .background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .frame(maxHeight: .infinity)
+    }
+
     var body: some View {
         ZStack {
             backgroundView.ignoresSafeArea()
             atmosphereOverlay.ignoresSafeArea()
 
-            VStack(spacing: 8) {
-                HStack(spacing: 10) {
-                    Image(systemName: "book.closed.fill")
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(headerPrimary)
-                        .frame(width: 38, height: 38)
-                        .background(
-                            LinearGradient(
-                                colors: [accentTint.opacity(0.55), Color.white.opacity(0.22)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        )
+            VStack(spacing: 10) {
+                header
 
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("BookGet GUI")
-                            .font(.system(size: 21, weight: .bold))
-                            .foregroundStyle(headerPrimary)
-                        Text("典籍下载工作台")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(headerPrimary.opacity(0.72))
-                    }
-
-                    Spacer()
-
-                    Button("支持网站信息") {
-                        clearInputFocus()
-                        showSitesInfo = true
-                    }
-
-                    Picker("配色", selection: $themeRaw) {
-                        ForEach(AppTheme.allCases) { t in
-                            Text(t.title).tag(t.rawValue)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 138)
-
-                    Picker("卡片", selection: $cardStyleRaw) {
-                        ForEach(CardVisualStyle.allCases) { s in
-                            Text(s.title).tag(s.rawValue)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 106)
-
-                    Text(vm.isRunning ? "运行中" : (vm.taskState == .paused ? "已暂停" : "空闲"))
-                        .font(.system(size: 12, weight: .semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background((vm.isRunning ? Color.orange : (vm.taskState == .paused ? Color.yellow : Color.green)).opacity(0.2), in: Capsule())
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(topBarBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(topBarBorder, lineWidth: 1)
-                )
-                .padding(.trailing, rightPanelNarrowInset)
-
-	                HStack(alignment: .top, spacing: 10) {
-		                    ScrollView(.vertical) {
-		                        VStack(spacing: 8) {
-		                        Card("基础设置", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
-	                            VStack(spacing: 8) {
-                                HStack(alignment: .top) {
-                                    Text("网址")
-                                        .frame(width: 52, alignment: .leading)
-                                        .foregroundStyle(cardSecondaryText)
-                                        .padding(.top, 6)
-                                    ZStack(alignment: .topLeading) {
-                                        if vm.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                            Text("每行一个网址，例如：\nhttps://example-1.com\nhttps://example-2.com")
-                                                .font(.system(size: 12))
-                                                .foregroundStyle(cardSecondaryText)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 8)
-                                        }
-                                        TextEditor(text: $vm.urlText)
-                                            .font(.system(size: 12))
-                                            .focused($focusedField, equals: .urlText)
-                                            .scrollContentBackground(.hidden)
-                                            .background(Color.clear)
-                                            .padding(.horizontal, 4)
-                                            .padding(.vertical, 2)
-                                            .restoreArrowCursorOnExit()
-                                    }
-                                    .frame(minHeight: 78, maxHeight: 96)
-                                    .background(urlEditorBackground)
-                                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                                    .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .stroke(urlEditorBorder, lineWidth: 1)
-                                    )
-                                }
-                                HStack {
-                                    Text("保存到")
-                                        .frame(width: 52, alignment: .leading)
-                                        .foregroundStyle(cardSecondaryText)
-                                    TextField("选择保存目录", text: $vm.saveDirectory)
-                                        .focused($focusedField, equals: .saveDirectory)
-                                        .textFieldStyle(.roundedBorder)
-                                        .restoreArrowCursorOnExit()
-                                    Button("选择") {
-                                        clearInputFocus()
-                                        vm.chooseDirectory()
-                                    }
-                                }
-                                HStack {
-                                    Text("验证")
-                                        .frame(width: 52, alignment: .leading)
-                                        .foregroundStyle(cardSecondaryText)
-		                                    Toggle("开启弹窗浏览器（适用于需要登录或验证的网站）", isOn: Binding(
-		                                        get: { vm.needLogin },
-		                                        set: { vm.applyNeedLogin($0) }
-		                                    ))
-	                                }
-                            }
-                        }
-
-	                        Card("最近使用", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
-	                            VStack(spacing: 6) {
-	                                HStack(spacing: 8) {
-	                                    Button("恢复上次设置") {
-	                                        clearInputFocus()
-	                                        vm.restoreLastUsed()
-	                                    }
-	                                    Button("恢复初始设置", role: .destructive) {
-	                                        clearInputFocus()
-	                                        showRestoreFactoryDefaultsConfirm = true
-	                                    }
-	                                    .disabled(vm.isRunning || vm.taskState == .paused)
-	                                    Button("清空最近记录", role: .destructive) {
-	                                        clearInputFocus()
-	                                        vm.clearRecentHistory()
-	                                    }
-	                                    Spacer()
-	                                }
-
-                                HStack(spacing: 8) {
-                                    Menu("最近网址") {
-                                        if vm.recentUrls.isEmpty {
-                                            Text("暂无记录")
-                                        } else {
-                                            ForEach(vm.recentUrls, id: \.self) { u in
-                                                Button(u) { vm.applyRecentURL(u) }
-                                            }
-                                        }
-                                    }
-                                    Menu("最近目录") {
-                                        if vm.recentDirectories.isEmpty {
-                                            Text("暂无记录")
-                                        } else {
-                                            ForEach(vm.recentDirectories, id: \.self) { d in
-                                                Button(d) { vm.applyRecentDirectory(d) }
-                                            }
-                                        }
-                                    }
-                                    Spacer()
-                                }
-	                            }
-	                        }
-	                        .alert("恢复初始设置？", isPresented: $showRestoreFactoryDefaultsConfirm) {
-	                            Button("恢复初始", role: .destructive) {
-	                                // Factory reset should also reset UI theme/card style to app defaults.
-	                                themeRaw = AppTheme.obsidian.rawValue
-	                                cardStyleRaw = CardVisualStyle.outline.rawValue
-	                                vm.restoreFactoryDefaults()
-	                            }
-	                            Button("取消", role: .cancel) { }
-	                        } message: {
-	                            Text("这会将设置、任务队列、进度与日志恢复到最初始状态。")
-	                        }
-	
-	                        Card("高级参数", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
-	                            VStack(spacing: 6) {
-	                                Toggle("启用高级参数", isOn: $vm.showAdvanced)
-	                                    .toggleStyle(.switch)
-                                if vm.showAdvanced {
-                                    HStack(spacing: 8) {
-                                        Picker("a (识别模式)", selection: $vm.appMode) {
-                                            Text("0（默认：内置站点规则）").tag("0")
-                                            Text("1（通用批量抓取）").tag("1")
-                                            Text("2（IIIF 自动识别）").tag("2")
-                                        }
-                                        .frame(width: 220)
-                                        .onChange(of: vm.appMode) { _, newValue in
-                                            vm.applyAppMode(newValue)
-                                        }
-                                        Spacer(minLength: 0)
-                                    }
-                                    HStack(spacing: 8) {
-                                        HStack {
-                                            Text("n (并发线程)")
-                                                .frame(width: 80, alignment: .leading)
-                                                .foregroundStyle(cardSecondaryText)
-                                            TextField("2", text: $vm.concurrency)
-                                                .focused($focusedField, equals: .concurrency)
-                                                .textFieldStyle(.roundedBorder)
-                                                .restoreArrowCursorOnExit()
-                                        }
-                                        Spacer(minLength: 0)
-                                    }
-                                    HStack(spacing: 8) {
-                                        HStack {
-                                            Text("r (失败重试)")
-                                                .frame(width: 80, alignment: .leading)
-                                                .foregroundStyle(cardSecondaryText)
-                                            TextField("3", text: $vm.retries)
-                                                .focused($focusedField, equals: .retries)
-                                                .textFieldStyle(.roundedBorder)
-                                                .restoreArrowCursorOnExit()
-                                        }
-                                        Spacer(minLength: 0)
-                                    }
-	                                    HStack(spacing: 8) {
-	                                        HStack {
-	                                            Text("interval (抓取间隔秒)")
-	                                                .frame(width: 90, alignment: .leading)
-	                                                .foregroundStyle(cardSecondaryText)
-	                                            TextField("", text: $vm.captureInterval)
-	                                                .focused($focusedField, equals: .captureInterval)
-	                                                .textFieldStyle(.roundedBorder)
-	                                                .restoreArrowCursorOnExit()
-	                                        }
-	                                        HStack {
-	                                            Text("seq (页码范围)")
-	                                                .frame(width: 95, alignment: .leading)
-	                                                .foregroundStyle(cardSecondaryText)
-	                                            TextField("如 4:50", text: $vm.seq)
-                                                .focused($focusedField, equals: .seq)
-                                                .textFieldStyle(.roundedBorder)
-                                                .restoreArrowCursorOnExit()
-                                        }
-                                    }
-                                    HStack(spacing: 8) {
-                                        HStack {
-                                            Text("vol (分册范围)")
-                                                .frame(width: 95, alignment: .leading)
-                                                .foregroundStyle(cardSecondaryText)
-                                            TextField("如 3:6", text: $vm.vol)
-                                                .focused($focusedField, equals: .vol)
-                                                .textFieldStyle(.roundedBorder)
-                                                .restoreArrowCursorOnExit()
-                                        }
-                                        Picker("扩展名 (输出格式)", selection: $vm.fileExt) {
-                                            Text("_（默认）").tag("_")
-                                            Text(".jpg").tag(".jpg")
-                                            Text(".png").tag(".png")
-                                            Text(".tif").tag(".tif")
-                                            Text(".pdf").tag(".pdf")
-                                        }
-                                        .frame(width: 190)
-                                    }
-                                    HStack(spacing: 8) {
-                                        Text("ua (浏览器标识)")
-                                            .frame(width: 115, alignment: .leading)
-                                            .foregroundStyle(cardSecondaryText)
-                                        Picker("", selection: $vm.uaPreset) {
-                                            ForEach(UserAgentPreset.allCases) { preset in
-                                                Text(preset.title).tag(preset.rawValue)
-                                            }
-                                        }
-                                        .frame(width: 150)
-                                        .onChange(of: vm.uaPreset) { _, newValue in
-                                            vm.applyUAPreset(newValue)
-                                        }
-                                        if vm.uaPreset == UserAgentPreset.custom.rawValue {
-                                            TextField("粘贴自定义 User-Agent", text: $vm.userAgent)
-                                                .focused($focusedField, equals: .userAgent)
-                                                .textFieldStyle(.roundedBorder)
-                                                .restoreArrowCursorOnExit()
-                                                .onChange(of: vm.userAgent) { _, newValue in
-                                                    vm.updateCustomUserAgent(newValue)
-                                                }
-                                        } else {
-                                            Text(vm.uaPreset == UserAgentPreset.coreDefault.rawValue ? "使用内核默认 UA" : "已选择预设 UA")
-                                                .font(.system(size: 11))
-                                                .foregroundStyle(cardSecondaryText)
-                                                .lineLimit(1)
-                                            Spacer(minLength: 0)
-                                        }
-                                    }
-
-                                    HStack(spacing: 8) {
-                                        Text("c (Cookie 文件)")
-                                            .frame(width: 115, alignment: .leading)
-                                            .foregroundStyle(cardSecondaryText)
-                                        TextField("可选：选择 cookie.txt", text: $vm.cookieFilePath)
-                                            .focused($focusedField, equals: .cookieFilePath)
-                                            .textFieldStyle(.roundedBorder)
-                                            .restoreArrowCursorOnExit()
-                                        Button("选择") {
-                                            clearInputFocus()
-                                            vm.chooseCookieFile()
-                                        }
-                                        Button("清空") {
-                                            clearInputFocus()
-                                            vm.clearCookieFile()
-                                        }
-                                        .disabled(vm.cookieFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                    }
-
-                                    HStack(spacing: 8) {
-                                        Text("localStorage (登录态)")
-                                            .frame(width: 115, alignment: .leading)
-                                            .foregroundStyle(cardSecondaryText)
-                                        TextField("可选：选择 localStorage.txt", text: $vm.localStorageFilePath)
-                                            .focused($focusedField, equals: .localStorageFilePath)
-                                            .textFieldStyle(.roundedBorder)
-                                            .restoreArrowCursorOnExit()
-                                        Button("选择") {
-                                            clearInputFocus()
-                                            vm.chooseLocalStorageFile()
-                                        }
-                                        Button("清空") {
-                                            clearInputFocus()
-                                            vm.clearLocalStorageFile()
-                                        }
-                                        .disabled(vm.localStorageFilePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                    }
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(spacing: 10) {
+                        ScrollView(.vertical) {
+                            VStack(spacing: 10) {
+                                inputCard
+                                advancedCard
+                                if !vm.showAdvanced {
+                                    tipsCard
                                 }
                             }
-                            .animation(.easeInOut(duration: 0.18), value: vm.showAdvanced)
+                            .padding(.vertical, 1)
                         }
+                        .scrollClipDisabledIfAvailable()
+                        .scrollIndicators(.never)
 
-		                        HStack(spacing: 8) {
-		                            Button {
-		                                clearInputFocus()
-		                                vm.startDownload()
-		                            } label: {
-		                                Label("开始下载", systemImage: "arrow.down.circle.fill")
-		                                    .frame(maxWidth: .infinity)
-		                            }
-		                            .frame(maxWidth: .infinity)
-		                            .buttonStyle(.borderedProminent)
-		                            .controlSize(.large)
-		                            .disabled(vm.isRunning || vm.taskState == .paused)
-		                            .onHover { inside in if inside { forceArrowCursor() } }
-
-		                            Button {
-		                                clearInputFocus()
-		                                vm.pauseDownload()
-		                            } label: {
-		                                Label("暂停", systemImage: "pause.circle")
-		                                    .frame(maxWidth: .infinity)
-		                            }
-		                            .frame(maxWidth: .infinity)
-		                            .buttonStyle(.bordered)
-		                            .controlSize(.large)
-		                            .disabled(!vm.isRunning)
-		                            .onHover { inside in if inside { forceArrowCursor() } }
-
-		                            Button {
-		                                clearInputFocus()
-		                                vm.resumeDownload()
-		                            } label: {
-		                                Label("继续", systemImage: "play.circle")
-		                                    .frame(maxWidth: .infinity)
-		                            }
-		                            .frame(maxWidth: .infinity)
-		                            .buttonStyle(.bordered)
-		                            .controlSize(.large)
-		                            .disabled(vm.taskState != .paused)
-		                            .onHover { inside in if inside { forceArrowCursor() } }
-
-		                            Button {
-		                                clearInputFocus()
-		                                vm.stopDownload()
-		                            } label: {
-		                                Label("终止", systemImage: "stop.circle")
-		                                    .frame(maxWidth: .infinity)
-		                            }
-		                            .frame(maxWidth: .infinity)
-		                            .buttonStyle(.bordered)
-		                            .controlSize(.large)
-		                            .disabled(!(vm.isRunning || vm.taskState == .paused))
-		                            .onHover { inside in if inside { forceArrowCursor() } }
-		                        }
-		                        .frame(maxWidth: .infinity)
-
-		                        }
-		                        .frame(maxWidth: .infinity, alignment: .top)
-		                        .padding(.vertical, 1)
-		                    }
-		                    .scrollClipDisabledIfAvailable()
-		                    .frame(maxWidth: 470)
-
-		                    ScrollView(.vertical) {
-		                        VStack(spacing: 8) {
-		                            Card("任务状态", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
-		                                VStack(alignment: .leading, spacing: 7) {
-                                HStack {
-                                    Text("状态")
-                                        .foregroundStyle(cardSecondaryText)
-                                    Text(vm.status)
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(cardPrimaryText)
-                                    Spacer()
-                                    Button("导出任务日志") {
-                                        clearInputFocus()
-                                        vm.exportTaskLog()
-                                    }
-                                        .disabled(vm.isRunning || vm.logEntries.isEmpty)
-                                        .onHover { inside in if inside { forceArrowCursor() } }
-                                    Button("打开目录") {
-                                        clearInputFocus()
-                                        vm.openSaveDirectory()
-                                    }
-                                    .onHover { inside in if inside { forceArrowCursor() } }
-                                }
-
-                                if vm.isRunning {
-                                    if vm.hasProgressEstimate {
-                                        ProgressView(value: vm.progressValue)
-                                            .progressViewStyle(.linear)
-                                    } else {
-                                        ProgressView()
-                                            .progressViewStyle(.linear)
-                                    }
-                                    Text(vm.progressText)
-                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(cardSecondaryText)
-                                } else if vm.hasProgressEstimate {
-                                    ProgressView(value: vm.progressValue)
-                                        .progressViewStyle(.linear)
-                                    Text(vm.progressText)
-                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(cardSecondaryText)
-                                }
-
-                                if !vm.detectedTotalText.isEmpty {
-                                    Text(vm.detectedTotalText)
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(cardSecondaryText)
-                                }
-
-                                Text(vm.detail)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(cardSecondaryText)
-
-                                if !vm.checkpointText.isEmpty {
-                                    Text(vm.checkpointText)
-                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                        .foregroundStyle(cardSecondaryText)
-                                        .lineLimit(1)
-                                }
-
-                                if !vm.exportedLogPath.isEmpty {
-                                    Text(vm.exportedLogPath)
-                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                        .foregroundStyle(cardSecondaryText)
-                                        .lineLimit(1)
-                                        .textSelection(.enabled)
-	                            }
-	                        }
-		                        .frame(maxWidth: .infinity, alignment: .top)
-		                        .padding(.vertical, 1)
-		                    }
-		                    .scrollClipDisabledIfAvailable()
-	                        }
-
-		                        Card("任务队列", subtitle: "队列与历史记录（累积显示）", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
-		                            VStack(alignment: .leading, spacing: 8) {
-		                                HStack(spacing: 10) {
-		                                    Text("总 \(queueSummary.total)")
-		                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-		                                        .foregroundStyle(cardSecondaryText)
-		                                    Text("完成 \(queueSummary.done)")
-		                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-		                                        .foregroundStyle(Color.green.opacity(0.95))
-		                                    Text("终止 \(queueSummary.stopped)")
-		                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-		                                        .foregroundStyle(cardSecondaryText)
-		                                    Text("失败 \(queueSummary.failed)")
-		                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-		                                        .foregroundStyle(Color.red.opacity(0.95))
-		                                    Spacer(minLength: 0)
-		                                    if !vm.queueRuns.isEmpty {
-		                                        Text("历史 \(vm.queueRuns.count) 次")
-		                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-		                                            .foregroundStyle(cardSecondaryText)
-		                                    }
-		                                }
-		                                if vm.taskState == .paused {
-		                                    Text("当前已暂停，可点击“继续”恢复。")
-		                                        .font(.system(size: 11))
-		                                        .foregroundStyle(cardSecondaryText)
-		                                }
-
-		                                ScrollView {
-		                                    LazyVStack(alignment: .leading, spacing: 6) {
-		                                        if vm.queueRuns.isEmpty {
-		                                            Text("等待任务开始...")
-		                                                .font(.system(size: 12))
-		                                                .foregroundStyle(cardSecondaryText)
-		                                        } else {
-		                                            ForEach(Array(vm.queueRuns.enumerated()), id: \.element.id) { runIdx, run in
-		                                                HStack {
-		                                                    Text("任务 \(runIdx + 1)")
-		                                                        .font(.system(size: 12, weight: .semibold))
-		                                                        .foregroundStyle(cardPrimaryText)
-		                                                    Text(run.startedAtText)
-		                                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-		                                                        .foregroundStyle(cardSecondaryText)
-		                                                    Spacer(minLength: 0)
-		                                                }
-		                                                .padding(.top, runIdx == 0 ? 0 : 6)
-
-		                                                ForEach(Array(run.items.enumerated()), id: \.element.id) { idx, item in
-		                                                    HStack(spacing: 8) {
-		                                                        Text("\(idx + 1).")
-		                                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-		                                                            .frame(width: 22, alignment: .leading)
-		                                                        Text(item.url)
-		                                                            .font(.system(size: 11, weight: .regular, design: .monospaced))
-		                                                            .lineLimit(1)
-		                                                        Spacer(minLength: 8)
-		                                                        Text(item.state.title)
-		                                                            .font(.system(size: 11, weight: .semibold))
-		                                                            .foregroundStyle(queueStateColor(item.state))
-		                                                            .padding(.horizontal, 8)
-		                                                            .padding(.vertical, 3)
-		                                                            .background(queueStateColor(item.state).opacity(0.16), in: Capsule())
-		                                                    }
-		                                                }
-		                                            }
-		                                        }
-		                                    }
-		                                    .padding(10)
-		                                }
-		                                .frame(minHeight: 108, maxHeight: 144)
-		                                .background(Color.black.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-		                            }
-		                        }
-
-                        Card("实时日志", subtitle: "单击「导出任务日志」可将日志导出到任务保存目录", style: cardStyle, primaryText: cardPrimaryText, secondaryText: cardSecondaryText) {
-                            LogConsoleView(entries: vm.logEntries, textColor: logTextNSColor)
-                            .frame(height: 320)
-                            .background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        }
+                        actionBar
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.trailing, rightPanelNarrowInset)
+                    .frame(width: 460)
+
+                    VStack(spacing: 10) {
+                        statusCard
+                        queueCard
+                        logCard
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                .frame(maxHeight: .infinity)
             }
-            .padding(10)
+            .padding(12)
             .tint(accentTint)
+            // Every theme except "system" paints a dark background; light
+            // system controls (white text fields, pale buttons) clash with it.
+            .environment(\.colorScheme, theme == .system ? colorScheme : .dark)
             .contentShape(Rectangle())
             .simultaneousGesture(TapGesture().onEnded {
                 clearInputFocus()
             })
+        }
+        .alert("恢复初始设置？", isPresented: $showRestoreFactoryDefaultsConfirm) {
+            Button("恢复初始", role: .destructive) {
+                // Factory reset should also reset UI theme/card style to app defaults.
+                themeRaw = AppTheme.obsidian.rawValue
+                cardStyleRaw = CardVisualStyle.outline.rawValue
+                vm.restoreFactoryDefaults()
+            }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("这会将设置、任务队列、进度与日志恢复到最初始状态。")
         }
         .sheet(isPresented: $showSitesInfo) {
             SupportedSitesSheet(sites: vm.supportedSites)
         }
         .background(
             WindowSizeEnforcer(
-                minWidth: 1120,
-                minHeight: 860,
+                minWidth: 1040,
+                minHeight: 760,
                 idealWidth: 1180,
                 idealHeight: 880
             )
             .frame(width: 0, height: 0)
         )
-        .frame(minWidth: 1120, idealWidth: 1180, maxWidth: 1400, minHeight: 860, idealHeight: 880, maxHeight: 1020)
+        .frame(minWidth: 1040, idealWidth: 1180, minHeight: 760, idealHeight: 880)
+    }
+}
+
+struct StatusDotLabelStyle: LabelStyle {
+    let color: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.icon
+                .font(.system(size: 7))
+                .foregroundStyle(color)
+            configuration.title
+        }
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard DownloadEngine.live.allObjects.contains(where: { $0.isBusy }) else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "仍有下载任务未完成"
+        alert.informativeText = "退出会终止当前下载。已下载的页面会保留，下次可从这个网址继续。"
+        alert.addButton(withTitle: "退出")
+        alert.addButton(withTitle: "取消")
+        alert.alertStyle = .warning
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         for engine in DownloadEngine.live.allObjects {
             engine.shutdownForAppExit()

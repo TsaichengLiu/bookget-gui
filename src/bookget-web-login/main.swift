@@ -150,6 +150,82 @@ struct SiteRegistry: Decodable {
     }
 }
 
+// MARK: - Logging / file helpers
+
+private func logError(_ message: String) {
+    FileHandle.standardError.write(Data("[bookget-web-login] \(message)\n".utf8))
+}
+
+/// URL for logs: query strings and fragments often carry tokens (token=..., ticket=...).
+private func redactedURLString(_ url: URL?) -> String {
+    guard let url else { return "" }
+    guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+        return url.absoluteString.components(separatedBy: "?").first ?? ""
+    }
+    let hadQuery = comps.percentEncodedQuery != nil || comps.percentEncodedFragment != nil
+    comps.percentEncodedQuery = nil
+    comps.percentEncodedFragment = nil
+    comps.user = nil
+    comps.password = nil
+    let base = comps.string ?? ""
+    return hadQuery ? base + "?…" : base
+}
+
+private func redactedURLString(_ raw: String) -> String {
+    if let url = URL(string: raw) { return redactedURLString(url) }
+    return raw.components(separatedBy: "?").first ?? ""
+}
+
+/// Response bodies for logs: may echo tokens or be huge HTML pages.
+private func truncatedForLog(_ data: Data, limit: Int = 200) -> String {
+    let text = String(decoding: data.prefix(limit * 4), as: UTF8.self)
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+    return text.count > limit ? String(text.prefix(limit)) + "…" : text
+}
+
+/// Writes `data` to `url` with POSIX mode 0600: written to a private temp file in the
+/// same directory, then renamed over the destination (replacing e.g. a 0644 mktemp file).
+private func writePrivateFile(_ data: Data, to url: URL) throws {
+    let fm = FileManager.default
+    let dir = url.deletingLastPathComponent()
+    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+    guard fm.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+        throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: tmp.path])
+    }
+    try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+    if rename(tmp.path, url.path) != 0 {
+        let err = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        try? fm.removeItem(at: tmp)
+        throw err
+    }
+}
+
+/// Atomically moves `source` over `destination` (same volume).
+private func atomicReplace(_ destination: URL, with source: URL) throws {
+    if rename(source.path, destination.path) != 0 {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
+private func fileStartsWithPDFMagic(_ url: URL) -> Bool {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+    defer { try? handle.close() }
+    let head = (try? handle.read(upToCount: 4)) ?? Data()
+    return head == Data("%PDF".utf8)
+}
+
+/// Filename-safe version of page text scraped from a web page (keeps CJK, drops path
+/// separators / control characters, limits length).
+private func sanitizedPageLabel(_ raw: String, fallback: String) -> String {
+    let forbidden = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.controlCharacters).union(.newlines)
+    let mapped = raw.unicodeScalars.map { forbidden.contains($0) ? "_" : String($0) }.joined()
+    var trimmed = mapped.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: ".")))
+    if trimmed.count > 60 { trimmed = String(trimmed.prefix(60)) }
+    return trimmed.isEmpty ? sanitizedFilenameComponent(fallback) : trimmed
+}
+
 private enum InteractiveSiteAdapterKind: String {
     case generic
     case shanghaiLibrary
@@ -161,7 +237,11 @@ private enum InteractiveSiteAdapterKind: String {
     }
 }
 
-private func usage(_ msg: String? = nil) -> Never {
+/// Exit codes: 0 ok, 1 failure, 2 user cancelled (wrapper maps to 130),
+/// 3 no login state captured, 64 bad command-line arguments (EX_USAGE).
+private let exitBadArguments: Int32 = 64
+
+private func usage(_ msg: String? = nil, code: Int32 = exitBadArguments) -> Never {
     if let msg {
         FileHandle.standardError.write(Data((msg + "\n").utf8))
     }
@@ -179,7 +259,7 @@ private func usage(_ msg: String? = nil) -> Never {
       bookget-web-login --detect-site <url>
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
-    exit(2)
+    exit(code)
 }
 
 private func parseArgs() -> Args {
@@ -196,7 +276,7 @@ private func parseArgs() -> Args {
     while i < argv.count {
         let a = argv[i]
         if a == "--help" || a == "-h" {
-            usage()
+            usage(code: 0)
         }
 
         func takeValue() -> String {
@@ -243,6 +323,10 @@ private func parseArgs() -> Args {
 
     guard let urlString, let url = URL(string: urlString) else {
         usage("Invalid or missing --url")
+    }
+    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+          let host = url.host, !host.isEmpty else {
+        usage("Invalid URL host: \(redactedURLString(url))")
     }
 
     let cookieOutURL: URL
@@ -336,7 +420,7 @@ private enum ShanghaiDownloadError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidReaderURL(let url):
-            return "invalid Shanghai reader URL: \(url)"
+            return "invalid Shanghai reader URL: \(redactedURLString(url))"
         case .missingOutDir:
             return "missing --out-dir for Shanghai Library download"
         case .missingInfoParameters:
@@ -421,6 +505,34 @@ private func makeShanghaiAPIRequest(
     request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
     request.timeoutInterval = 60
 
+    let maxRetries = 3
+    var retry = 0
+    while true {
+        do {
+            let (data, response) = try performSynchronousRequest(request)
+            let status = response.statusCode
+            if (status == 429 || (500...599).contains(status)) && retry < maxRetries {
+                retry += 1
+                let delay = shanghaiRetryDelay(retry: retry, response: response)
+                logError("shl HTTP \(status) from \(redactedURLString(finalURL)), retry \(retry)/\(maxRetries) in \(Int(delay))s")
+                Thread.sleep(forTimeInterval: delay)
+                continue
+            }
+            return (data, response)
+        } catch {
+            if retry < maxRetries && isRetryableNetworkError(error) {
+                retry += 1
+                let delay = shanghaiRetryDelay(retry: retry, response: nil)
+                logError("shl network error (\((error as NSError).localizedDescription)), retry \(retry)/\(maxRetries) in \(Int(delay))s")
+                Thread.sleep(forTimeInterval: delay)
+                continue
+            }
+            throw error
+        }
+    }
+}
+
+private func performSynchronousRequest(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
     let semaphore = DispatchSemaphore(value: 0)
     var responseData = Data()
     var responseError: Error?
@@ -442,6 +554,27 @@ private func makeShanghaiAPIRequest(
         throw ShanghaiDownloadError.streamRequestFailed("missing HTTP response")
     }
     return (responseData, httpResponse)
+}
+
+private func isRetryableNetworkError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    guard nsError.domain == NSURLErrorDomain else { return false }
+    switch nsError.code {
+    case NSURLErrorCancelled, NSURLErrorBadURL, NSURLErrorUnsupportedURL,
+         NSURLErrorUserAuthenticationRequired, NSURLErrorUserCancelledAuthentication:
+        return false
+    default:
+        return true
+    }
+}
+
+/// Exponential backoff (2s, 4s, 8s); honours a short Retry-After header.
+private func shanghaiRetryDelay(retry: Int, response: HTTPURLResponse?) -> TimeInterval {
+    if let raw = response?.value(forHTTPHeaderField: "Retry-After"),
+       let seconds = Double(raw.trimmingCharacters(in: .whitespaces)), seconds > 0 {
+        return min(seconds, 30)
+    }
+    return pow(2.0, Double(retry))
 }
 
 private func downloadShanghaiLibraryPDFView(args: Args) throws {
@@ -476,13 +609,12 @@ private func downloadShanghaiLibraryPDFView(args: Args) throws {
         jsonBody: infoBody
     )
     guard (200..<300).contains(infoResponse.statusCode) else {
-        let message = String(data: infoData, encoding: .utf8) ?? "HTTP \(infoResponse.statusCode)"
-        throw ShanghaiDownloadError.infoRequestFailed(message)
+        throw ShanghaiDownloadError.infoRequestFailed("HTTP \(infoResponse.statusCode): \(truncatedForLog(infoData))")
     }
 
     let info = try JSONDecoder().decode(ShanghaiInfoResponse.self, from: infoData)
     guard info.state == 0, let payload = info.data, !payload.items.isEmpty else {
-        throw ShanghaiDownloadError.infoRequestFailed(info.msg ?? "empty item list")
+        throw ShanghaiDownloadError.infoRequestFailed(info.msg.map { truncatedForLog(Data($0.utf8)) } ?? "empty item list")
     }
 
     FileHandle.standardError.write(Data("[bookget-web-login] shl info loaded: \(payload.items.count) item(s)\n".utf8))
@@ -499,6 +631,15 @@ private func downloadShanghaiLibraryPDFView(args: Args) throws {
         let partialURL = outDir.appendingPathComponent(fileName.replacingOccurrences(of: ".pdf", with: ".partial.pdf"))
         let pagesDir = outDir.appendingPathComponent(fileName.replacingOccurrences(of: ".pdf", with: ".pages"), isDirectory: true)
 
+        guard item.pageCount > 0 else {
+            logError("shl item \(itemIndex + 1)/\(payload.items.count): \(safeItemName) reports 0 pages, skipped")
+            continue
+        }
+        if fileStartsWithPDFMagic(outURL) {
+            logError("shl item \(itemIndex + 1)/\(payload.items.count): \(outURL.lastPathComponent) already exists, skipped")
+            continue
+        }
+
         try FileManager.default.createDirectory(at: pagesDir, withIntermediateDirectories: true)
 
         func pageCacheURL(_ pageNo: Int) -> URL {
@@ -513,7 +654,12 @@ private func downloadShanghaiLibraryPDFView(args: Args) throws {
             return size.intValue > 0
         }
 
-        func mergeCachedPages(into destinationURL: URL) throws -> Int {
+        /// Merges cached page PDFs into a temp file next to `finalURL`, then renames it
+        /// into place so an interrupted merge never leaves a truncated PDF behind.
+        func mergeCachedPages(into finalURL: URL) throws -> Int {
+            let destinationURL = finalURL.deletingLastPathComponent()
+                .appendingPathComponent(".\(finalURL.lastPathComponent).\(UUID().uuidString).tmp")
+            defer { try? FileManager.default.removeItem(at: destinationURL) }
             var merged = PDFDocument()
             var appendedPages = 0
 
@@ -552,6 +698,9 @@ private func downloadShanghaiLibraryPDFView(args: Args) throws {
             }
 
             try compactMergedDocumentIfNeeded(force: true)
+            if appendedPages > 0 {
+                try atomicReplace(finalURL, with: destinationURL)
+            }
             return appendedPages
         }
 
@@ -578,8 +727,7 @@ private func downloadShanghaiLibraryPDFView(args: Args) throws {
                     jsonBody: streamBody
                 )
                 guard (200..<300).contains(pageResponse.statusCode) else {
-                    let message = String(data: pageData, encoding: .utf8) ?? "HTTP \(pageResponse.statusCode)"
-                    throw ShanghaiDownloadError.streamRequestFailed(message)
+                    throw ShanghaiDownloadError.streamRequestFailed("HTTP \(pageResponse.statusCode): \(truncatedForLog(pageData))")
                 }
                 let isValidPage = try autoreleasepool { () throws -> Bool in
                     guard let pageDocument = PDFDocument(data: pageData), pageDocument.pageCount > 0 else {
@@ -796,12 +944,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     private var window: NSWindow!
     private var rootView: NSView!
     private var webView: WKWebView!
+    /// Hidden 1x1 view returned to WebKit for window.open()/target=_blank; its first real
+    /// navigation is redirected into the main view.
     private var popupBridgeWebView: WKWebView?
+    /// Real child windows for OAuth/QR-login popups that rely on window.opener.
+    private var popupWindows: [(webView: WKWebView, window: NSWindow)] = []
     private var urlField: NSTextField!
+    private var doneButton: NSButton!
+    private var backButton: NSButton!
+    private var forwardButton: NSButton!
+    private var loadingSpinner: NSProgressIndicator!
+    private var statusSpinner: NSProgressIndicator!
+    private var statusLabel: NSTextField!
+    private var observations: [NSKeyValueObservation] = []
+    private var contentProcessReloads: [ObjectIdentifier: Int] = [:]
+    private static let maxContentProcessReloads = 3
     private var isCompleting = false
     private var isScraping = false
-    private var scrapeRetryCount = 0
     private var lastMeaningfulShanghaiLibraryReaderURL: String?
+
+    // rbook scrape state
+    private static let maxScrapeNoProgress = 20
+    private var scrapeNoProgressCount = 0
+    private var lastSavedPageLabel: String?
+    private var savedPageCount = 0
+    private var progressPanel: NSPanel?
+    private var progressLabel: NSTextField?
+    private var progressBar: NSProgressIndicator?
 
     private static let captureMeaningfulURLScript = #"""
     (function() {
@@ -919,6 +1088,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         return value == "about:blank" || value == "about:srcdoc" || value.hasPrefix("javascript:")
     }
 
+    /// OAuth / QR-login popups usually talk back to window.opener, so they need a real
+    /// child window instead of being redirected into the main view.
+    private func isAuthPopupURL(_ url: URL?) -> Bool {
+        guard let host = url?.host?.lowercased(), !host.isEmpty else { return false }
+        return ["login", "oauth", "sso", "passport", "auth"].contains { host.contains($0) }
+    }
+
     private func loadRequestInMainWebView(_ request: URLRequest) {
         rememberMeaningfulShanghaiLibraryReaderURL(request.url)
         if let abs = request.url?.absoluteString, !abs.isEmpty {
@@ -927,10 +1103,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         webView.load(request)
     }
 
-    private func popupBridgeView(with configuration: WKWebViewConfiguration) -> WKWebView {
-        if let existing = popupBridgeWebView {
-            return existing
-        }
+    private func removePopupBridge() {
+        guard let bridge = popupBridgeWebView else { return }
+        bridge.stopLoading()
+        bridge.uiDelegate = nil
+        bridge.navigationDelegate = nil
+        bridge.removeFromSuperview()
+        popupBridgeWebView = nil
+    }
+
+    /// WebKit requires the returned view to be created with the configuration it passes,
+    /// so a fresh bridge is built for every popup (the previous one is discarded).
+    private func makePopupBridgeView(with configuration: WKWebViewConfiguration) -> WKWebView {
+        removePopupBridge()
 
         let popup = WKWebView(frame: NSRect(x: 0, y: 0, width: 1, height: 1), configuration: configuration)
         popup.translatesAutoresizingMaskIntoConstraints = false
@@ -950,12 +1135,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         return popup
     }
 
+    private func makePopupWindow(with configuration: WKWebViewConfiguration, windowFeatures: WKWindowFeatures?) -> WKWebView {
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        popup.customUserAgent = userAgent
+        popup.uiDelegate = self
+        popup.navigationDelegate = self
+        presentPopupWindow(for: popup, windowFeatures: windowFeatures)
+        return popup
+    }
+
+    /// Shows `popup` in its own child window (used for new auth popups, and to promote a
+    /// hidden bridge view whose first navigation turned out to be an auth host).
+    private func presentPopupWindow(for popup: WKWebView, windowFeatures: WKWindowFeatures?) {
+        if popup === popupBridgeWebView {
+            popup.removeFromSuperview()
+            popupBridgeWebView = nil
+            popup.isHidden = false
+            popup.alphaValue = 1
+        }
+        popup.translatesAutoresizingMaskIntoConstraints = true
+        popup.autoresizingMask = [.width, .height]
+
+        let width = CGFloat(windowFeatures?.width?.doubleValue ?? 520)
+        let height = CGFloat(windowFeatures?.height?.doubleValue ?? 640)
+        let child = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: max(320, width), height: max(320, height)),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        child.title = "登录窗口 (BookGet)"
+        child.isReleasedWhenClosed = false
+        child.delegate = self
+        popup.frame = child.contentLayoutRect
+        child.contentView = popup
+        if let parent = window {
+            let pf = parent.frame
+            child.setFrameOrigin(NSPoint(x: pf.midX - child.frame.width / 2, y: pf.midY - child.frame.height / 2))
+        } else {
+            child.center()
+        }
+        popupWindows.append((webView: popup, window: child))
+        child.makeKeyAndOrderFront(nil)
+    }
+
+    private func popupWindowEntry(for webView: WKWebView) -> (webView: WKWebView, window: NSWindow)? {
+        popupWindows.first { $0.webView === webView }
+    }
+
     private func webViewRole(_ webView: WKWebView) -> String {
         if webView === self.webView {
             return "main"
         }
         if let popupBridgeWebView, webView === popupBridgeWebView {
             return "popup"
+        }
+        if popupWindowEntry(for: webView) != nil {
+            return "popup-window"
         }
         return "unknown"
     }
@@ -965,14 +1201,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
             return
         }
-        let urlText = failingURL?.absoluteString ?? targetURL.absoluteString
+        let urlText = redactedURLString(failingURL ?? targetURL)
         FileHandle.standardError.write(Data("[bookget-web-login] \(role) webview \(stage) failed: \(urlText) (\(nsError.localizedDescription))\n".utf8))
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if targetHost.isEmpty {
-            FileHandle.standardError.write(Data(("Invalid URL host: \(targetURL.absoluteString)\n").utf8))
-            exit(2)
+            FileHandle.standardError.write(Data(("Invalid URL host: \(redactedURLString(targetURL))\n").utf8))
+            exit(exitBadArguments)
         }
 
         // Keep the temporary login/scrape helper out of the Dock.
@@ -986,7 +1222,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             backing: .buffered,
             defer: false
         )
-        window.title = (mode == .rbookScrape ? "國圖下載 (BookGet) - \(targetHost)" : "弹窗浏览器 (BookGet) - \(targetHost)")
+        window.title = (mode == .rbookScrape ? "国图下载 (BookGet) - \(targetHost)" : "弹窗浏览器 (BookGet) - \(targetHost)")
+        window.subtitle = targetHost
         window.center()
         window.delegate = self
 
@@ -996,24 +1233,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
         let instructionText: String = {
             if mode == .rbookScrape {
-                return "请在此窗口完成验证码/登录。点击“开始下载”后窗口会隐藏并开始保存图片到目标文件夹。"
+                return "请在此窗口完成验证码/登录，然后点击“开始下载”（⌘↩）。下载期间请勿关闭本窗口，进度会显示在单独的小窗口中，可随时取消。"
             }
             if siteAdapter == .shanghaiLibrary {
-                return "请在此弹窗浏览器中完成登录/验证码。若页面有“查看全文/阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”。"
+                return "请在此弹窗浏览器中完成登录/验证码。若页面有“查看全文/阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”（⌘↩）。"
             }
-            return "请在此弹窗浏览器中完成登录/验证码。若页面有“阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”，窗口会关闭并继续下载。"
+            return "请在此弹窗浏览器中完成登录/验证码。若页面有“阅读/在线阅读”等按钮，请先点击进入阅读页（新窗口会被自动接管到本窗口），再点击“完成”（⌘↩），窗口会关闭并继续下载。"
         }()
-        let instruction = NSTextField(labelWithString: instructionText)
+        let instruction = NSTextField(wrappingLabelWithString: instructionText)
         instruction.translatesAutoresizingMaskIntoConstraints = false
         instruction.font = NSFont.systemFont(ofSize: 13)
         instruction.textColor = .secondaryLabelColor
-        instruction.lineBreakMode = .byWordWrapping
-        instruction.maximumNumberOfLines = 2
+        instruction.maximumNumberOfLines = 0
+        instruction.setContentCompressionResistancePriority(.required, for: .vertical)
+        instruction.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let urlLabel = NSTextField(labelWithString: "网址")
-        urlLabel.translatesAutoresizingMaskIntoConstraints = false
-        urlLabel.font = NSFont.systemFont(ofSize: 12)
-        urlLabel.textColor = .secondaryLabelColor
+        func toolbarButton(_ symbol: String, _ fallback: String, _ tip: String, _ action: Selector) -> NSButton {
+            let button: NSButton
+            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip) {
+                button = NSButton(image: image, target: self, action: action)
+            } else {
+                button = NSButton(title: fallback, target: self, action: action)
+            }
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.bezelStyle = .texturedRounded
+            button.toolTip = tip
+            return button
+        }
+        backButton = toolbarButton("chevron.left", "后退", "后退", #selector(onGoBack))
+        forwardButton = toolbarButton("chevron.right", "前进", "前进", #selector(onGoForward))
+        let reloadButton = toolbarButton("arrow.clockwise", "刷新", "刷新", #selector(onReload))
+        backButton.isEnabled = false
+        forwardButton.isEnabled = false
 
         urlField = NSTextField(string: targetURL.absoluteString)
         urlField.translatesAutoresizingMaskIntoConstraints = false
@@ -1024,13 +1275,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         urlField.target = self
         urlField.action = #selector(onGoToURL)
 
+        loadingSpinner = NSProgressIndicator()
+        loadingSpinner.translatesAutoresizingMaskIntoConstraints = false
+        loadingSpinner.style = .spinning
+        loadingSpinner.controlSize = .small
+        loadingSpinner.isDisplayedWhenStopped = false
+        loadingSpinner.toolTip = "页面加载中"
+
         let go = NSButton(title: "前往", target: self, action: #selector(onGoToURL))
         go.translatesAutoresizingMaskIntoConstraints = false
 
         let backToStart = NSButton(title: "回到起始页", target: self, action: #selector(onBackToStart))
         backToStart.translatesAutoresizingMaskIntoConstraints = false
 
-        let urlBar = NSStackView(views: [urlLabel, urlField, go, backToStart])
+        let urlBar = NSStackView(views: [backButton, forwardButton, reloadButton, urlField, loadingSpinner, go, backToStart])
         urlBar.translatesAutoresizingMaskIntoConstraints = false
         urlBar.orientation = .horizontal
         urlBar.spacing = 8
@@ -1042,25 +1300,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         webView.customUserAgent = userAgent
         webView.uiDelegate = self
         webView.navigationDelegate = self
+        observeMainWebView()
 
         let doneTitle = (mode == .rbookScrape ? "开始下载" : "完成")
-        let done = NSButton(title: doneTitle, target: self, action: #selector(onDone))
-        done.translatesAutoresizingMaskIntoConstraints = false
-        done.keyEquivalent = "\r"
+        doneButton = NSButton(title: doneTitle, target: self, action: #selector(onDone))
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
+        // Plain Return would fire while typing into login forms; require ⌘↩.
+        doneButton.keyEquivalent = "\r"
+        doneButton.keyEquivalentModifierMask = [.command]
+        doneButton.toolTip = "\(doneTitle)（⌘↩）"
 
         let cancel = NSButton(title: "取消", target: self, action: #selector(onCancel))
         cancel.translatesAutoresizingMaskIntoConstraints = false
         cancel.keyEquivalent = "\u{1b}"
 
-        let buttonRow = NSStackView(views: [cancel, done])
+        let buttonRow = NSStackView(views: [cancel, doneButton])
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 12
         buttonRow.alignment = .centerY
 
+        statusSpinner = NSProgressIndicator()
+        statusSpinner.translatesAutoresizingMaskIntoConstraints = false
+        statusSpinner.style = .spinning
+        statusSpinner.controlSize = .small
+        statusSpinner.isDisplayedWhenStopped = false
+
+        statusLabel = NSTextField(labelWithString: "")
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let statusRow = NSStackView(views: [statusSpinner, statusLabel])
+        statusRow.translatesAutoresizingMaskIntoConstraints = false
+        statusRow.orientation = .horizontal
+        statusRow.spacing = 6
+        statusRow.alignment = .centerY
+
         rootView.addSubview(instruction)
         rootView.addSubview(urlBar)
         rootView.addSubview(webView)
+        rootView.addSubview(statusRow)
         rootView.addSubview(buttonRow)
 
         NSLayoutConstraint.activate([
@@ -1075,7 +1357,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             buttonRow.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -12),
             buttonRow.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -12),
 
-            urlField.widthAnchor.constraint(greaterThanOrEqualToConstant: 420),
+            statusRow.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 12),
+            statusRow.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
+            statusRow.trailingAnchor.constraint(lessThanOrEqualTo: buttonRow.leadingAnchor, constant: -12),
+
+            urlField.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
 
             webView.topAnchor.constraint(equalTo: urlBar.bottomAnchor, constant: 10),
             webView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
@@ -1089,6 +1375,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         webView.load(URLRequest(url: targetURL))
     }
 
+    /// Keeps the address bar, title, navigation buttons and loading indicator in sync,
+    /// including client-side (pushState) URL changes that never fire didFinish.
+    private func observeMainWebView() {
+        observations = [
+            webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
+                DispatchQueue.main.async {
+                    guard let self, let url = webView.url else { return }
+                    self.rememberMeaningfulShanghaiLibraryReaderURL(url)
+                    // Don't clobber what the user is typing.
+                    if self.urlField.currentEditor() == nil {
+                        self.urlField.stringValue = url.absoluteString
+                    }
+                }
+            },
+            webView.observe(\.title, options: [.new]) { [weak self] webView, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    let title = (webView.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let prefix = (self.mode == .rbookScrape ? "国图下载 (BookGet)" : "弹窗浏览器 (BookGet)")
+                    self.window.title = title.isEmpty ? "\(prefix) - \(self.targetHost)" : "\(title) — \(prefix)"
+                    self.window.subtitle = webView.url?.host ?? self.targetHost
+                }
+            },
+            webView.observe(\.isLoading, options: [.new]) { [weak self] webView, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if webView.isLoading {
+                        self.loadingSpinner.startAnimation(nil)
+                    } else {
+                        self.loadingSpinner.stopAnimation(nil)
+                    }
+                }
+            },
+            webView.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
+                DispatchQueue.main.async { self?.backButton.isEnabled = webView.canGoBack }
+            },
+            webView.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
+                DispatchQueue.main.async { self?.forwardButton.isEnabled = webView.canGoForward }
+            },
+        ]
+    }
+
+    private func setStatus(_ text: String?, busy: Bool) {
+        statusLabel.stringValue = text ?? ""
+        if busy {
+            statusSpinner.startAnimation(nil)
+        } else {
+            statusSpinner.stopAnimation(nil)
+        }
+    }
+
+    @objc private func onGoBack() {
+        webView.goBack()
+    }
+
+    @objc private func onGoForward() {
+        webView.goForward()
+    }
+
+    @objc private func onReload() {
+        contentProcessReloads[ObjectIdentifier(webView)] = 0
+        webView.reload()
+    }
+
     @objc private func onGoToURL() {
         let raw = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return }
@@ -1097,6 +1447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             text = "https://" + text
         }
         guard let url = URL(string: text) else { return }
+        window.makeFirstResponder(webView)
         webView.load(URLRequest(url: url))
     }
 
@@ -1106,7 +1457,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     }
 
     // Some sites open the reader in a new window/tab (target=_blank / window.open).
-    // Keep the flow in the same temporary window so "完成" can capture the real reader URL.
+    // Keep the flow in the same temporary window so "完成" can capture the real reader URL,
+    // except for OAuth/QR-login hosts, which get a real child window (they need window.opener).
     func webView(
         _ webView: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,
@@ -1114,34 +1466,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         let prepared = makeBrowserConfiguration(from: configuration)
-        if let url = navigationAction.request.url {
-            rememberMeaningfulShanghaiLibraryReaderURL(url)
-            if !isBlankPopupURL(url) {
-                let popup = popupBridgeView(with: prepared)
-                return popup
-            }
+        let url = navigationAction.request.url
+        rememberMeaningfulShanghaiLibraryReaderURL(url)
+        if !isBlankPopupURL(url) && isAuthPopupURL(url) {
+            return makePopupWindow(with: prepared, windowFeatures: windowFeatures)
         }
-        return popupBridgeView(with: prepared)
+        return makePopupBridgeView(with: prepared)
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        if let entry = popupWindowEntry(for: webView) {
+            entry.window.close()
+            return
+        }
+        if let popupBridgeWebView, webView === popupBridgeWebView {
+            removePopupBridge()
+        }
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        if let popupBridgeWebView, webView === popupBridgeWebView {
-            if let url = navigationAction.request.url, !isBlankPopupURL(url) {
-                loadRequestInMainWebView(navigationAction.request)
-                decisionHandler(.cancel)
+        let url = navigationAction.request.url
+        if let popupBridgeWebView, webView === popupBridgeWebView, !isBlankPopupURL(url) {
+            if isAuthPopupURL(url) {
+                // window.open('') followed by navigation to a login host: promote to a real window.
+                presentPopupWindow(for: webView, windowFeatures: nil)
+                decisionHandler(.allow)
                 return
             }
-            decisionHandler(.allow)
+            loadRequestInMainWebView(navigationAction.request)
+            decisionHandler(.cancel)
             return
         }
 
-        if navigationAction.targetFrame == nil {
-            if let url = navigationAction.request.url, !isBlankPopupURL(url) {
-                loadRequestInMainWebView(navigationAction.request)
-                decisionHandler(.cancel)
-                return
-            }
-            decisionHandler(.allow)
+        if webView === self.webView, navigationAction.targetFrame == nil, !isBlankPopupURL(url) {
+            loadRequestInMainWebView(navigationAction.request)
+            decisionHandler(.cancel)
             return
         }
         decisionHandler(.allow)
@@ -1150,8 +1509,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         let role = webViewRole(webView)
         rememberMeaningfulShanghaiLibraryReaderURL(webView.url)
-        if role == "main", let u = webView.url?.absoluteString {
+        contentProcessReloads[ObjectIdentifier(webView)] = 0
+        if role == "main", let u = webView.url?.absoluteString, urlField.currentEditor() == nil {
             urlField.stringValue = u
+        } else if role == "popup-window", let entry = popupWindowEntry(for: webView) {
+            let title = (webView.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            entry.window.title = title.isEmpty ? "登录窗口 (BookGet)" : title
         }
     }
 
@@ -1165,12 +1528,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        FileHandle.standardError.write(Data("[bookget-web-login] \(webViewRole(webView)) webview content process terminated, reloading...\n".utf8))
+        let key = ObjectIdentifier(webView)
+        let count = (contentProcessReloads[key] ?? 0) + 1
+        contentProcessReloads[key] = count
+        let role = webViewRole(webView)
+        guard count <= Self.maxContentProcessReloads else {
+            logError("\(role) webview content process terminated \(count) times, not reloading again")
+            if role == "main" {
+                setStatus("页面进程多次崩溃，请点击“刷新”重试。", busy: false)
+            }
+            return
+        }
+        logError("\(role) webview content process terminated, reloading (\(count)/\(Self.maxContentProcessReloads))...")
         webView.reload()
     }
 
     func windowWillClose(_ notification: Notification) {
-        exit(2)
+        guard let closing = notification.object as? NSWindow else { return }
+        if closing === window {
+            exit(2)
+        }
+        if let idx = popupWindows.firstIndex(where: { $0.window === closing }) {
+            let popup = popupWindows.remove(at: idx).webView
+            popup.stopLoading()
+            popup.uiDelegate = nil
+            popup.navigationDelegate = nil
+            contentProcessReloads[ObjectIdentifier(popup)] = nil
+        }
     }
 
     @objc private func onCancel() {
@@ -1180,6 +1564,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     @objc private func onDone() {
         if isCompleting { return }
         isCompleting = true
+        doneButton.isEnabled = false
+        setStatus("正在定位阅读页…", busy: true)
 
         func isShanghaiLibraryReaderURL(_ urlString: String) -> Bool {
             self.isShanghaiLibraryReaderURL(urlString)
@@ -1283,30 +1669,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 lines.append("\(domainField)\t\(includeSubdomains)\t\(path)\t\(secure)\t\(expires)\t\(name)\t\(value)")
             }
 
-            let header = """
-            # Netscape HTTP Cookie File
-            # Generated by bookget-web-login (WKWebView, non-persistent)
-
-            """
-            let body = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
-            do {
-                try FileManager.default.createDirectory(
-                    at: self.cookieOutURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try (header + body).write(to: self.cookieOutURL, atomically: true, encoding: .utf8)
-            } catch {
-                FileHandle.standardError.write(Data(("登录状态写入失败：\(error)\n").utf8))
-                exit(1)
-            }
-
             if let urlOutURL = self.urlOutURL {
                 do {
-                    try FileManager.default.createDirectory(
-                        at: urlOutURL.deletingLastPathComponent(),
-                        withIntermediateDirectories: true
-                    )
-                    try (finalURLString + "\n").write(to: urlOutURL, atomically: true, encoding: .utf8)
+                    try writePrivateFile(Data((finalURLString + "\n").utf8), to: urlOutURL)
                 } catch {
                     // Cookie capture is the primary signal; URL out is best-effort.
                     FileHandle.standardError.write(Data(("登录后网址写入失败：\(error)\n").utf8))
@@ -1314,8 +1679,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             }
 
             if lines.isEmpty {
+                if self.mode == .rbookScrape {
+                    // rbook pages are scraped inside this web view; cookies are optional.
+                    logError("no cookies captured for \(self.targetHost); continuing rbook scrape")
+                    completion()
+                    return
+                }
                 FileHandle.standardError.write(Data(("已匹配到站点，但未获取到登录状态：\(self.targetHost)\n").utf8))
                 exit(3)
+            }
+
+            let header = """
+            # Netscape HTTP Cookie File
+            # Generated by bookget-web-login (WKWebView, non-persistent)
+
+            """
+            let body = lines.joined(separator: "\n") + "\n"
+            do {
+                try writePrivateFile(Data((header + body).utf8), to: self.cookieOutURL)
+            } catch {
+                FileHandle.standardError.write(Data(("登录状态写入失败：\(error)\n").utf8))
+                exit(1)
             }
 
             // Keep stdout output for wrapper debugging; wrapper currently discards stdout.
@@ -1419,6 +1803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 }
 
                 if attempt < 2 && isShanghaiLibraryRedirectPage(currentURLString) {
+                    self.setStatus("等待跳转完成…（第 \(attempt + 1) 次重试）", busy: true)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                         attemptResolveAndProceed(attempt + 1, completion: completion)
                     }
@@ -1428,6 +1813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 if attempt < 2 && isShanghaiLibraryDetailPage(currentURLString, html: html) {
                     autoClickShanghaiLibraryFullTextIfPresent { clicked in
                         if clicked {
+                            self.setStatus("已自动点击“查看全文”，等待阅读页加载…（第 \(attempt + 1) 次）", busy: true)
                             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                                 attemptResolveAndProceed(attempt + 1, completion: completion)
                             }
@@ -1443,6 +1829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
                 if attempt == 0 && isSearchDetail {
                     autoClickRBookViewerIfPresent { clicked in
                         if clicked {
+                            self.setStatus("已自动进入影像浏览页，等待加载…", busy: true)
                             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                                 attemptResolveAndProceed(1, completion: completion)
                             }
@@ -1458,10 +1845,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
 
         attemptResolveAndProceed(0) { finalURLString in
+            self.setStatus("正在导出登录状态…", busy: true)
             if self.mode == .rbookScrape {
-                self.window.orderOut(nil)
-                self.isScraping = true
                 captureLoginState(finalURLString: finalURLString) {
+                    self.isScraping = true
                     self.startRBookScrape()
                 }
                 return
@@ -1484,8 +1871,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             exit(1)
         }
 
+        // The web view must stay in a visible window to keep rendering pages, so the
+        // browser window stays open (behind) and a small progress panel offers 取消.
+        showScrapeProgressPanel()
+        updateScrapeProgress(page: nil, total: nil, note: "正在打开影像浏览页…")
+        setStatus("正在下载，请勿关闭本窗口…", busy: true)
+
         FileHandle.standardError.write(Data("[bookget-web-login] rbook scrape started: \(outDir.path)\n".utf8))
         ensureRBookViewerReady(tries: 0)
+    }
+
+    private func showScrapeProgressPanel() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 110),
+            styleMask: [.titled, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "国图下载进度"
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+
+        let content = NSView()
+        let label = NSTextField(labelWithString: "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 13)
+        label.lineBreakMode = .byTruncatingTail
+
+        let bar = NSProgressIndicator()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.style = .bar
+        bar.isIndeterminate = true
+        bar.minValue = 0
+        bar.maxValue = 1
+        bar.startAnimation(nil)
+
+        let cancel = NSButton(title: "取消", target: self, action: #selector(onCancel))
+        cancel.translatesAutoresizingMaskIntoConstraints = false
+        cancel.keyEquivalent = "\u{1b}"
+
+        content.addSubview(label)
+        content.addSubview(bar)
+        content.addSubview(cancel)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
+            label.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            bar.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 10),
+            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            bar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            cancel.topAnchor.constraint(equalTo: bar.bottomAnchor, constant: 10),
+            cancel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            cancel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+        ])
+        panel.contentView = content
+
+        let wf = window.frame
+        panel.setFrameTopLeftPoint(NSPoint(x: wf.maxX - 380, y: wf.maxY - 40))
+        panel.orderFrontRegardless()
+
+        progressPanel = panel
+        progressLabel = label
+        progressBar = bar
+    }
+
+    private func updateScrapeProgress(page: String?, total: String?, note: String? = nil) {
+        let text: String
+        if let note {
+            text = note
+        } else if let page, let total, !total.isEmpty {
+            text = "正在抓取第 \(page) / \(total) 页"
+        } else if let page {
+            text = "正在抓取第 \(page) 页"
+        } else {
+            text = "正在抓取…"
+        }
+        progressLabel?.stringValue = text
+        if let bar = progressBar, let totalCount = total.flatMap({ Int($0) }), totalCount > 0 {
+            if bar.isIndeterminate {
+                bar.stopAnimation(nil)
+                bar.isIndeterminate = false
+            }
+            bar.maxValue = Double(totalCount)
+            bar.doubleValue = Double(min(savedPageCount, totalCount))
+        }
     }
 
     private func ensureRBookViewerReady(tries: Int) {
@@ -1533,6 +2003,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
     }
 
+    private func clickNextRBookPage(then: @escaping () -> Void) {
+        webView.evaluateJavaScript("var b=document.getElementById('AftT'); if (b) { b.click(); true } else { false }") { _, _ in
+            then()
+        }
+    }
+
     private func scrapeCurrentRBookPage() {
         if !isScraping { return }
 
@@ -1547,9 +2023,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
           if (totalEl) totalPages = (totalEl.textContent || '').trim().replace('/ ', '').replace('/', '');
           var w = img ? (img.naturalWidth || 0) : 0;
           var h = img ? (img.naturalHeight || 0) : 0;
+          var complete = img ? !!img.complete : false;
           var src = img ? (img.currentSrc || img.src || '') : '';
           var dataUrl = '';
-          if (img && w > 0 && h > 0) {
+          var tainted = false;
+          if (img && complete && w > 0 && h > 0) {
             try {
               var canvas = document.createElement('canvas');
               canvas.width = w;
@@ -1564,9 +2042,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
               }
             } catch (e) {
               dataUrl = '';
+              tainted = true;
             }
           }
-          return { pageNum: pageNum, totalPages: totalPages, width: w, height: h, dataUrl: dataUrl, src: src };
+          return { pageNum: pageNum, totalPages: totalPages, width: w, height: h, dataUrl: dataUrl, src: src, tainted: tainted };
         })();
         """#
 
@@ -1580,52 +2059,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             let w = dict["width"] as? Int ?? 0
             let h = dict["height"] as? Int ?? 0
             let dataUrl = (dict["dataUrl"] as? String) ?? ""
+            let src = (dict["src"] as? String) ?? ""
 
-            if pageNum.isEmpty || totalPages.isEmpty || w <= 0 || h <= 0 || dataUrl.count < 200 {
-                self.retryScrapeSoon(reason: "not ready (page=\(pageNum) total=\(totalPages) w=\(w) h=\(h) b64=\(dataUrl.count))")
+            if pageNum.isEmpty || totalPages.isEmpty || w <= 0 || h <= 0 {
+                self.retryScrapeSoon(reason: "not ready (page=\(pageNum) total=\(totalPages) w=\(w) h=\(h))")
                 return
             }
 
-            guard let outDir = self.outDir else { exit(1) }
-            let fn = "第\(pageNum)頁.png"
-            let outURL = outDir.appendingPathComponent(fn)
-            guard let data = Data(base64Encoded: dataUrl, options: [.ignoreUnknownCharacters]) else {
-                self.retryScrapeSoon(reason: "base64 decode failed")
+            if let last = self.lastSavedPageLabel, last == pageNum {
+                // The viewer did not move on after clicking "next"; click again every few tries.
+                let clickAgain = self.scrapeNoProgressCount % 5 == 4
+                self.retryScrapeSoon(reason: "page \(pageNum) not advanced", clickNext: clickAgain)
                 return
             }
-            do {
-                try data.write(to: outURL, options: [.atomic])
-            } catch {
-                FileHandle.standardError.write(Data("[bookget-web-login] write failed: \(outURL.path) (\(error))\n".utf8))
-                exit(1)
+
+            self.updateScrapeProgress(page: pageNum, total: totalPages)
+
+            if dataUrl.count >= 200, let data = Data(base64Encoded: dataUrl, options: [.ignoreUnknownCharacters]) {
+                self.saveRBookPage(data, pageNum: pageNum, totalPages: totalPages)
+                return
             }
 
-            self.scrapeRetryCount = 0
-            FileHandle.standardError.write(Data("[bookget-web-login] saved \(pageNum)/\(totalPages): \(fn)\n".utf8))
-
-            if pageNum == totalPages {
-                FileHandle.standardError.write(Data("[bookget-web-login] rbook scrape complete\n".utf8))
-                exit(0)
+            // Cross-origin images taint the canvas (toDataURL throws): fetch the src
+            // directly with this web view's cookies instead.
+            guard !src.isEmpty, !src.lowercased().hasPrefix("blob:"), let srcURL = URL(string: src) else {
+                self.retryScrapeSoon(reason: "canvas export failed and no fetchable src (page=\(pageNum))")
+                return
             }
-
-            self.webView.evaluateJavaScript("var b=document.getElementById('AftT'); if (b) { b.click(); true } else { false }") { _, _ in
-                DispatchQueue.main.asyncAfter(deadline: .now() + self.intervalSeconds) {
-                    self.scrapeCurrentRBookPage()
+            self.fetchRBookImage(srcURL) { data in
+                guard let data else {
+                    self.retryScrapeSoon(reason: "image fetch failed: \(redactedURLString(srcURL))")
+                    return
                 }
+                self.saveRBookPage(data, pageNum: pageNum, totalPages: totalPages)
             }
         }
     }
 
-    private func retryScrapeSoon(reason: String) {
-        scrapeRetryCount += 1
-        if scrapeRetryCount % 10 == 1 {
-            FileHandle.standardError.write(Data("[bookget-web-login] waiting page render: \(reason)\n".utf8))
+    /// Downloads `url` with the web view's cookies and converts it to PNG bytes
+    /// (pages are always saved as 第N頁.png).
+    private func fetchRBookImage(_ url: URL, completion: @escaping (Data?) -> Void) {
+        func toPNG(_ data: Data) -> Data? {
+            guard let rep = NSBitmapImageRep(data: data) else { return nil }
+            return rep.representation(using: .png, properties: [:])
         }
-        let delay = min(2.0, max(0.5, intervalSeconds / 2.0))
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            if self.isScraping {
+
+        if url.scheme?.lowercased() == "data" {
+            let raw = url.absoluteString
+            guard let comma = raw.firstIndex(of: ","), raw[..<comma].contains(";base64"),
+                  let data = Data(base64Encoded: String(raw[raw.index(after: comma)...]), options: [.ignoreUnknownCharacters]) else {
+                completion(nil)
+                return
+            }
+            completion(toPNG(data))
+            return
+        }
+
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+            let host = url.host ?? ""
+            let matching = cookies.filter { cookieMatchesHost(cookie: $0, host: host) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 60
+            request.httpShouldHandleCookies = false
+            request.setValue(self.userAgent, forHTTPHeaderField: "User-Agent")
+            if let referer = self.webView.url?.absoluteString {
+                request.setValue(referer, forHTTPHeaderField: "Referer")
+            }
+            for (k, v) in HTTPCookie.requestHeaderFields(with: matching) {
+                request.setValue(v, forHTTPHeaderField: k)
+            }
+            let session = URLSession(configuration: .ephemeral)
+            session.dataTask(with: request) { data, response, error in
+                session.finishTasksAndInvalidate()
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                var png: Data?
+                if error == nil, (200..<300).contains(status), let data, !data.isEmpty {
+                    png = toPNG(data)
+                } else {
+                    logError("rbook image fetch HTTP \(status): \(redactedURLString(url))")
+                }
+                DispatchQueue.main.async { completion(png) }
+            }.resume()
+        }
+    }
+
+    private func saveRBookPage(_ data: Data, pageNum: String, totalPages: String) {
+        if !isScraping { return }
+        guard let outDir = self.outDir else { exit(1) }
+        let label = sanitizedPageLabel(pageNum, fallback: "\(savedPageCount + 1)")
+        let fn = "第\(label)頁.png"
+        let outURL = outDir.appendingPathComponent(fn)
+        do {
+            try data.write(to: outURL, options: [.atomic])
+        } catch {
+            FileHandle.standardError.write(Data("[bookget-web-login] write failed: \(outURL.path) (\(error))\n".utf8))
+            exit(1)
+        }
+
+        scrapeNoProgressCount = 0
+        lastSavedPageLabel = pageNum
+        savedPageCount += 1
+        updateScrapeProgress(page: pageNum, total: totalPages)
+        FileHandle.standardError.write(Data("[bookget-web-login] saved \(pageNum)/\(totalPages): \(fn)\n".utf8))
+
+        let isLast: Bool = {
+            if pageNum == totalPages { return true }
+            if let p = Int(pageNum), let t = Int(totalPages), t > 0 { return p >= t }
+            return false
+        }()
+        if isLast {
+            FileHandle.standardError.write(Data("[bookget-web-login] rbook scrape complete\n".utf8))
+            exit(0)
+        }
+
+        clickNextRBookPage {
+            DispatchQueue.main.asyncAfter(deadline: .now() + self.intervalSeconds) {
                 self.scrapeCurrentRBookPage()
             }
+        }
+    }
+
+    private func retryScrapeSoon(reason: String, clickNext: Bool = false) {
+        scrapeNoProgressCount += 1
+        if scrapeNoProgressCount >= Self.maxScrapeNoProgress {
+            logError("rbook scrape stalled after \(scrapeNoProgressCount) attempts without progress: \(reason)")
+            exit(1)
+        }
+        if scrapeNoProgressCount % 5 == 1 {
+            logError("waiting page render (\(scrapeNoProgressCount)/\(Self.maxScrapeNoProgress)): \(reason)")
+        }
+        let delay = min(2.0, max(0.5, intervalSeconds / 2.0))
+        let next = {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if self.isScraping {
+                    self.scrapeCurrentRBookPage()
+                }
+            }
+        }
+        if clickNext {
+            clickNextRBookPage(then: next)
+        } else {
+            next()
         }
     }
 }
