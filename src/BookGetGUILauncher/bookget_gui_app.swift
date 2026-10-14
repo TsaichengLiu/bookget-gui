@@ -340,7 +340,54 @@ struct DownloadOptions {
     }
 }
 
+/// The wrapper is a zsh script that runs bookget-core, curl and the login
+/// helper as children; `Process.terminate()` only reaches the script itself,
+/// so those children used to keep downloading after pause/stop.
+enum ProcessTree {
+    static func descendants(of root: pid_t) -> [pid_t] {
+        var result: [pid_t] = []
+        var pending: [pid_t] = [root]
+        var buffer = [pid_t](repeating: 0, count: 512)
+        while let pid = pending.popLast() {
+            // With a buffer this returns the number of child pids written.
+            let count = buffer.withUnsafeMutableBytes {
+                proc_listchildpids(pid, $0.baseAddress, Int32($0.count))
+            }
+            guard count > 0 else { continue }
+            let children = buffer.prefix(Int(count)).filter { $0 > 0 }
+            result.append(contentsOf: children)
+            pending.append(contentsOf: children)
+        }
+        return result
+    }
+
+    /// SIGTERM to the root and every descendant, then SIGCONT so a core the
+    /// wrapper stopped in interval mode can act on it. Survivors get SIGKILL
+    /// after `graceSeconds` (synchronously when `wait` is true, e.g. on quit).
+    static func terminate(root: pid_t, graceSeconds: Double = 3, wait: Bool = false) {
+        let pids = [root] + descendants(of: root)
+        for pid in pids { kill(pid, SIGTERM) }
+        for pid in pids { kill(pid, SIGCONT) }
+        let killSurvivors = {
+            for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        }
+        if wait {
+            usleep(useconds_t(graceSeconds * 1_000_000))
+            killSurvivors()
+        } else {
+            DispatchQueue.global().asyncAfter(deadline: .now() + graceSeconds, execute: killSurvivors)
+        }
+    }
+}
+
 final class DownloadEngine {
+    /// Lets the app delegate stop every running download on quit.
+    static let live = NSHashTable<DownloadEngine>.weakObjects()
+
+    init() {
+        DownloadEngine.live.add(self)
+    }
+
     var onState: ((DownloadTaskState, String) -> Void)?
     var onTaskStarted: ((Int, Int, String) -> Void)?
     var onTaskFinished: ((Int, Int, Int32) -> Void)?
@@ -366,6 +413,8 @@ final class DownloadEngine {
     private var appModeTriedByIndex: [Int: [String]] = [:]
     private var runLogBuffer: String = ""
     private let runLogLock = NSLock()
+    private var pendingOutput = Data()
+    private let outputLock = NSLock()
 
     private func markQueueItemsStopped(from startIndex: Int, note: String) {
         guard startIndex >= 0, startIndex < queueItems.count else { return }
@@ -403,7 +452,7 @@ final class DownloadEngine {
     func pause() {
         guard state == .running || state == .retrying else { return }
         isPauseRequested = true
-        process?.terminate()
+        terminateProcessTree()
     }
 
     func resume(options: DownloadOptions? = nil) {
@@ -426,13 +475,25 @@ final class DownloadEngine {
 
         let isProcRunning = process?.isRunning ?? false
         if isProcRunning {
-            process?.terminate()
+            terminateProcessTree()
             return
         }
 
         state = .stopped
         onState?(.stopped, "任务已终止。")
         onFinished?(failCount)
+    }
+
+    private func terminateProcessTree() {
+        guard let proc = process, proc.isRunning else { return }
+        ProcessTree.terminate(root: proc.processIdentifier)
+    }
+
+    /// Called from applicationWillTerminate: nothing may outlive the app.
+    func shutdownForAppExit() {
+        isStopping = true
+        guard let proc = process, proc.isRunning else { return }
+        ProcessTree.terminate(root: proc.processIdentifier, graceSeconds: 0.5, wait: true)
     }
 
     private func runNext() {
@@ -511,17 +572,26 @@ final class DownloadEngine {
         proc.standardOutput = pipe
         proc.standardError = pipe
 
+        outputLock.lock()
+        pendingOutput.removeAll()
+        outputLock.unlock()
+
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let self else { return }
-            guard let str = String(data: data, encoding: .utf8), !str.isEmpty else { return }
-            self.appendRunLog(str)
-            self.onLogChunk?(str)
+            guard !data.isEmpty else {
+                // EOF: stop being called in a loop.
+                handle.readabilityHandler = nil
+                return
+            }
+            self?.consumeOutput(data, flushAll: false)
         }
 
         proc.terminationHandler = { [weak self] p in
             guard let self else { return }
-            self.outputPipe?.fileHandleForReading.readabilityHandler = nil
+            let handle = pipe.fileHandleForReading
+            handle.readabilityHandler = nil
+            // The last lines are usually the error the retry logic looks for.
+            self.consumeOutput(Self.readRemainingWithoutBlocking(handle), flushAll: true)
             DispatchQueue.main.async {
                 self.handleTermination(status: p.terminationStatus, url: originalURL, index: index, total: total)
             }
@@ -627,6 +697,44 @@ final class DownloadEngine {
         currentIndex += 1
         state = .running
         runNext()
+    }
+
+    /// Emits only complete lines (up to the last \n or \r), so a multi-byte
+    /// UTF-8 character or a line split across two reads is neither dropped
+    /// nor broken in half.
+    private func consumeOutput(_ data: Data, flushAll: Bool) {
+        outputLock.lock()
+        defer { outputLock.unlock() }
+        pendingOutput.append(data)
+
+        var emit = Data()
+        if flushAll || pendingOutput.count > 64 * 1024 {
+            emit = pendingOutput
+            pendingOutput = Data()
+        } else if let last = pendingOutput.lastIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
+            emit = Data(pendingOutput[pendingOutput.startIndex...last])
+            pendingOutput = Data(pendingOutput[pendingOutput.index(after: last)...])
+        }
+        guard !emit.isEmpty else { return }
+
+        let str = String(decoding: emit, as: UTF8.self)
+        appendRunLog(str)
+        onLogChunk?(str)
+    }
+
+    /// A grandchild that escaped termination may still hold the pipe open, so
+    /// readDataToEndOfFile() could block forever; read what is there and stop.
+    private static func readRemainingWithoutBlocking(_ handle: FileHandle) -> Data {
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            guard n > 0 else { break }
+            result.append(contentsOf: buffer[0..<n])
+        }
+        return result
     }
 
     private func resetRunLog() {
@@ -1357,7 +1465,10 @@ final class DownloadViewModel: ObservableObject {
                 if state == .stopped {
                     self.progressText = "已终止"
                 }
-                if state == .paused || state == .stopped || state == .completed || state == .failed {
+                // Keep the log open across pause so lines after resume are kept;
+                // flush first so the final lines reach the file before it closes.
+                if state == .stopped || state == .completed || state == .failed {
+                    self.flushPendingLogNow()
                     self.sealTempLogFile()
                 }
             }
@@ -3014,8 +3125,18 @@ struct ContentView: View {
     }
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        for engine in DownloadEngine.live.allObjects {
+            engine.shutdownForAppExit()
+        }
+    }
+}
+
 @main
 struct BookGetGUIApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()

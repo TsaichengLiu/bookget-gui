@@ -138,10 +138,24 @@ cleanup_auto_cookie_files() {
   local f
   for f in "${AUTO_COOKIE_TEMP_FILES[@]}"; do
     [[ -n "$f" ]] || continue
-    rm -f "$f" 2>/dev/null || true
+    # Every entry comes from mktemp (some are mktemp -d), so -r is safe here.
+    rm -rf -- "$f" 2>/dev/null || true
   done
+  AUTO_COOKIE_TEMP_FILES=()
+}
+
+# The GUI's pause/stop sends SIGTERM. Without a handler zsh dies without
+# running the EXIT trap, leaving temp files behind and bookget-core running
+# as an orphan. CONT wakes a core that interval mode has SIGSTOPped.
+on_wrapper_signal() {
+  trap - TERM INT HUP
+  pkill -TERM -P $$ 2>/dev/null || true
+  pkill -CONT -P $$ 2>/dev/null || true
+  cleanup_auto_cookie_files
+  exit 143
 }
 trap cleanup_auto_cookie_files EXIT
+trap on_wrapper_signal TERM INT HUP
 
 parent_domain_key() {
   local host="$1"
@@ -423,6 +437,7 @@ run_core_with_optional_get_interval() {
   fifo="$(mktemp -u "${TMPDIR:-/tmp}/bookget-stream.XXXXXX" 2>/dev/null)"
   [[ -n "$fifo" ]] || return 99
   mkfifo "$fifo" 2>/dev/null || return 99
+  AUTO_COOKIE_TEMP_FILES+=("$fifo")
 
   "$CORE_BIN" "${cmd_args[@]}" >"$fifo" 2>&1 &
   pid=$!
@@ -649,10 +664,15 @@ while (( idx <= ${#orig_args[@]} )); do
       ;;
     *)
       if [[ "$arg" == *"http://"* || "$arg" == *"https://"* ]]; then
-        normalized="${arg//\\n/$'\n'}"
-        normalized="${normalized//,/\\n}"
+        # $'\n' is not expanded inside a quoted ${//} replacement; use a variable.
+        nl=$'\n'
+        normalized="${arg//\\n/$nl}"
+        # Only split on "," / ";" that directly precede another URL: IIIF paths
+        # (full/,1000/) and ";jsessionid=" contain them inside a single URL.
+        normalized="${normalized//,http/${nl}http}"
+        normalized="${normalized//;http/${nl}http}"
         while IFS= read -r token || [[ -n "$token" ]]; do
-          token="$(printf '%s' "$token" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+          token="$(printf '%s' "$token" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[,;]+$//')"
           [[ -z "$token" ]] && continue
           if [[ "$token" == http://* || "$token" == https://* ]]; then
             if [[ -z "${seen_urls[$token]:-}" ]]; then
@@ -660,7 +680,7 @@ while (( idx <= ${#orig_args[@]} )); do
               seen_urls[$token]=1
             fi
           fi
-        done <<< "$(printf '%s\n' "$normalized" | tr '; \t' '\n')"
+        done <<< "$(printf '%s\n' "$normalized" | tr ' \t' '\n')"
       else
         filtered_args+=("$arg")
       fi
@@ -746,6 +766,16 @@ is_file_signature_valid() {
   esac
 }
 
+# The output dir is often ~/Downloads, where the browser and other apps also
+# write. Only files with an extension the downloader produces are judged, and
+# only the invalid ones are ever removed.
+is_downloader_output_file() {
+  case "${1:e:l}" in
+    jpg|jpeg|png|pdf|tif|tiff|jp2|webp|gif) return 0 ;;
+  esac
+  return 1
+}
+
 validate_new_files_since_marker() {
   local dir_path="$1"
   local marker_file="$2"
@@ -756,6 +786,7 @@ validate_new_files_since_marker() {
 
   while IFS= read -r -d '' src_file; do
     found=1
+    is_downloader_output_file "$src_file" || continue
     is_file_signature_valid "$src_file" || has_invalid=1
   done < <(find "$dir_path" -type f -newer "$marker_file" -print0 2>/dev/null)
 
@@ -771,8 +802,13 @@ validate_new_files_since_marker() {
 remove_new_files_since_marker() {
   local dir_path="$1"
   local marker_file="$2"
+  local src_file
   [[ -d "$dir_path" && -f "$marker_file" ]] || return 0
-  find "$dir_path" -type f -newer "$marker_file" -delete 2>/dev/null || true
+  while IFS= read -r -d '' src_file; do
+    is_downloader_output_file "$src_file" || continue
+    is_file_signature_valid "$src_file" && continue
+    rm -f "$src_file" 2>/dev/null || true
+  done < <(find "$dir_path" -type f -newer "$marker_file" -print0 2>/dev/null)
 }
 
 remove_empty_dirs_since_marker() {
@@ -814,6 +850,7 @@ run_single_url_temp_merge() {
   local new_status=0
 
   tmp_file="$(mktemp "${TMPDIR:-/tmp}/bookget-url.XXXXXX")" || return 98
+  AUTO_COOKIE_TEMP_FILES+=("$tmp_file")
   print -r -- "$url" > "$tmp_file"
 
   if [[ -z "$base_output_dir" ]]; then
@@ -834,6 +871,7 @@ run_single_url_temp_merge() {
     rm -f "$tmp_file"
     return 97
   fi
+  AUTO_COOKIE_TEMP_FILES+=("$marker_file")
 
   local args=("${filtered_args[@]}")
   apply_auto_cookie_override_to_args "$url" args
@@ -924,6 +962,7 @@ run_single_url_temp_merge() {
       rm -f "$marker_file" "$tmp_file"
       return 99
     }
+    AUTO_COOKIE_TEMP_FILES+=("$log_file")
     run_core_with_optional_get_interval "$url" "$log_file" args
     output_code=$?
     if (( output_code == 0 )) && grep -Eiq "Unsupported URL|处理URL失败|task panic recovered|panic: runtime error" "$log_file"; then
@@ -982,6 +1021,7 @@ run_single_url() {
   local new_status=0
 
   tmp_file="$(mktemp "${TMPDIR:-/tmp}/bookget-url.XXXXXX")" || return 98
+  AUTO_COOKIE_TEMP_FILES+=("$tmp_file")
   print -r -- "$url" > "$tmp_file"
 
   target_output_dir="$output_dir"
@@ -995,6 +1035,7 @@ run_single_url() {
     rm -f "$tmp_file"
     return 97
   fi
+  AUTO_COOKIE_TEMP_FILES+=("$marker_file")
 
   local args=("${filtered_args[@]}")
   apply_auto_cookie_override_to_args "$url" args
@@ -1085,6 +1126,7 @@ run_single_url() {
       rm -f "$marker_file" "$tmp_file"
       return 99
     }
+    AUTO_COOKIE_TEMP_FILES+=("$log_file")
     run_core_with_optional_get_interval "$url" "$log_file" args
     output_code=$?
     if (( output_code == 0 )) && grep -Eiq "Unsupported URL|处理URL失败|task panic recovered|panic: runtime error" "$log_file"; then
@@ -1818,27 +1860,16 @@ run_rbook_scrape() {
   fi
 
   echo "[bookget wrapper] rbook special-case: using WebView scrape into: $out (capture-interval=${interval}s)" >&2
-  local old_term_trap old_int_trap pid
-  old_term_trap="$(trap -p TERM 2>/dev/null || true)"
-  old_int_trap="$(trap -p INT 2>/dev/null || true)"
+  local pid
 
   "$helper" --rbook-scrape --url "$url" --out-dir "$out" --interval "$interval" >/dev/null &
   pid=$!
-  trap "kill -TERM $pid 2>/dev/null || true" TERM
-  trap "kill -TERM $pid 2>/dev/null || true" INT
+  # zsh's `trap -p` prints nothing, so save/restore is not possible; stop the
+  # helper and then the whole wrapper, then reinstall the global handler.
+  trap "kill -TERM $pid 2>/dev/null || true; on_wrapper_signal" TERM INT HUP
   wait $pid
   rc=$?
-
-  if [[ -n "$old_term_trap" ]]; then
-    eval "$old_term_trap"
-  else
-    trap - TERM
-  fi
-  if [[ -n "$old_int_trap" ]]; then
-    eval "$old_int_trap"
-  else
-    trap - INT
-  fi
+  trap on_wrapper_signal TERM INT HUP
 
   if (( rc == 2 )); then
     return 130
@@ -1915,6 +1946,7 @@ resolve_ncl_rbook_url() {
   # Fallback: use bookget-core itself to fetch the entry page HTML (works even when curl is blocked).
   if [[ -z "$page" ]]; then
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/bookget-rbook-resolve.XXXXXX" 2>/dev/null)" || tmpd=""
+    [[ -n "$tmpd" ]] && AUTO_COOKIE_TEMP_FILES+=("$tmpd")
     if [[ -n "$tmpd" ]]; then
       url_file="$(mktemp "$tmpd/url.XXXXXX" 2>/dev/null || true)"
       marker_file="$(mktemp "$tmpd/.marker.XXXXXX" 2>/dev/null || true)"
